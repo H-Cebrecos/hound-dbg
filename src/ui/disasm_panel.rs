@@ -1,6 +1,6 @@
 use egui::{Color32, Context, RichText};
 
-pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
+pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
     let mut frame = egui::Frame::central_panel(&ctx.style());
     frame.fill = ctx.style().visuals.panel_fill.gamma_multiply(0.7);
 
