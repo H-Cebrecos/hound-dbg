@@ -1,0 +1,17 @@
+[package]
+name = "hound"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+egui = "0.32.0"
+eframe = "0.32.0"
+catppuccin-egui = { version = "5.7.0", default-features = false, features = ["egui32"] }
+rfd = "0.17.2"
+rustc-demangle = "0.1.27"
+cpp_demangle = "0.5.1"
+capstone = "0.14.0"
+object = "0.39.1"
+addr2line = "0.27.1"
+ctxp = {git = "https://github.com/H-Cebrecos/ctxp-rs.git"}
+anyhow = "1.0.103"
