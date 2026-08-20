@@ -80,12 +80,15 @@ impl Ui {
             let _event_dec = ctxp::Decoder::open(path).unwrap();
             //TODO: finish ctxp encoder so that we can generate a transcoder to text here.
             //Store the event collection somewhere.
-        } else if let Ok(disasm) = DisasmBinary::load(path) {
-            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-            self.app.objects.push(ObjectFile { name, disasm });
-            self.symbol_panel_open = true;
         } else {
-            //TODO: unsupported file
+            match DisasmBinary::load(path) {
+                Ok(disasm) => {
+                    let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+                    self.app.objects.push(ObjectFile { name, disasm });
+                    self.symbol_panel_open = true;
+                }
+                Err(e) => eprintln!("{:?}", e),
+            }
         }
     }
 

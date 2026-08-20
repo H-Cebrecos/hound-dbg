@@ -12,7 +12,10 @@ use std::{fs, ops::Range};
 use addr2line::fallible_iterator::FallibleIterator;
 use capstone::{
     Capstone, Insn,
-    arch::{self, BuildsCapstone, BuildsCapstoneExtraMode, riscv::RiscVInsnGroup::*},
+    arch::{
+        self, BuildsCapstone, BuildsCapstoneEndian, BuildsCapstoneExtraMode,
+        arm64::Arm64InsnGroup::*, riscv::RiscVInsnGroup::*,
+    },
 };
 
 use object::{Architecture, Object, ObjectSection, ObjectSymbol, SectionKind, SymbolKind};
@@ -154,12 +157,31 @@ impl DisasmBinary {
         let mut index: Vec<DisasmInstr> = Vec::new();
         for sec in &sections {
             let Ok(data) = sec.data() else {
-                return Err(DisasmError::BackendError("Section with no data".into()));
+                return Err(DisasmError::BackendError(format!(
+                    "section {:?} at {:#x} has no data",
+                    sec.name().unwrap_or("<unnamed>"),
+                    sec.address(),
+                )));
             };
 
-            let Ok(instructions) = engine.decode(data, sec.address()) else {
-                return Err(DisasmError::BackendError("Error decoding".into()));
-            };
+            let instructions = engine.decode(data, sec.address()).map_err(|e| {
+                DisasmError::BackendError(format!(
+                    "failed to decode section {:?} ({:#x}..{:#x}, {} bytes): {:?}",
+                    sec.name().unwrap_or("<unnamed>"),
+                    sec.address(),
+                    sec.address() + data.len() as u64,
+                    data.len(),
+                    e,
+                ))
+            })?;
+
+            eprintln!(
+                "decoded {} instrs from section at {:#x}, {} bytes",
+                instructions.len(),
+                sec.address(),
+                data.len()
+            );
+
             index.extend(instructions);
         }
 
@@ -363,7 +385,7 @@ struct CapstoneBackend {
 
 impl CapstoneBackend {
     pub fn new(arch: Architecture) -> Self {
-        let capstone = match arch {
+        let mut capstone = match arch {
             Architecture::Riscv32 => Capstone::new()
                 .riscv()
                 .mode(arch::riscv::ArchMode::RiscV32)
@@ -381,13 +403,21 @@ impl CapstoneBackend {
                 .unwrap(),
 
             Architecture::Arm => todo!(),
-            Architecture::Aarch64 => todo!(),
+            Architecture::Aarch64 => Capstone::new()
+                .arm64()
+                .mode(arch::arm64::ArchMode::Arm)
+                .endian(capstone::Endian::Little) //TODO: support big endian
+                .detail(true)
+                .build()
+                .unwrap(),
 
             Architecture::Wasm32 => todo!(),
             Architecture::Wasm64 => todo!(),
 
             _ => todo!("Unsuported architecture {:?}", arch),
         };
+
+        capstone.set_skipdata(true).unwrap();
 
         CapstoneBackend {
             arch,
@@ -398,10 +428,10 @@ impl CapstoneBackend {
     fn classify_instr(&self, insn: &Insn) -> Result<InstrKind, DisasmError> {
         match self.arch {
             Architecture::Riscv32 | Architecture::Riscv64 => {
-                let detail = self
-                    .engine
-                    .insn_detail(insn)
-                    .map_err(|e| DisasmError::BackendError(e.to_string()))?;
+                let detail = match self.engine.insn_detail(insn) {
+                    Ok(d) => d,
+                    Err(_) => return Ok(InstrKind::Other),
+                };
 
                 let groups = detail.groups();
 
@@ -447,7 +477,56 @@ impl CapstoneBackend {
                     Ok(InstrKind::Other)
                 }
             }
+            Architecture::Aarch64 => {
+                let detail = match self.engine.insn_detail(insn) {
+                    Ok(d) => d,
+                    Err(_) => return Ok(InstrKind::Other),
+                };
 
+                let groups = detail.groups();
+
+                let mut has_ret = false;
+                let mut has_branch = false;
+                let mut has_jump = false;
+
+                for g in groups {
+                    match g.0 as u32 {
+                        ARM64_GRP_RET => has_ret = true,
+                        ARM64_GRP_BRANCH_RELATIVE => has_branch = true,
+                        ARM64_GRP_JUMP | ARM64_GRP_CALL => has_jump = true,
+                        _ => {}
+                    }
+                }
+                if has_ret {
+                    return Ok(InstrKind::Return);
+                }
+
+                if has_branch || has_jump {
+                    let imm = detail
+                        .arch_detail()
+                        .operands()
+                        .iter()
+                        .find_map(|op| match op {
+                            arch::ArchOperand::Arm64Operand(op) => match op.op_type {
+                                arch::arm64::Arm64OperandType::Imm(imm) => Some(imm),
+                                _ => None,
+                            },
+                            _ => None,
+                        });
+
+                    Ok(match (has_branch, imm) {
+                        (true, Some(imm)) => {
+                            InstrKind::CondBranch(insn.address().wrapping_add(imm as u64))
+                        }
+                        (false, Some(imm)) => {
+                            InstrKind::DirectJump(insn.address().wrapping_add(imm as u64))
+                        }
+                        (_, None) => InstrKind::IndirectJump,
+                    })
+                } else {
+                    Ok(InstrKind::Other)
+                }
+            }
             arch => Err(DisasmError::UnsupportedArchitecture(arch)),
         }
     }
