@@ -71,6 +71,7 @@ impl DisasmInstr {
 }
 
 /// Decoded instruction sequence for a single symbol.
+#[derive(Debug, Clone, Copy)]
 pub struct DisasmFunction<'a> {
     /// Symbol name.
     pub name: &'a str, // borrows from the metadata vec

@@ -2,6 +2,7 @@ use std::path::Path;
 
 use eframe::NativeOptions;
 use egui::{FontData, FontDefinitions, FontFamily, RichText};
+use fuzzy_matcher::skim::SkimMatcherV2;
 
 use crate::{App, ObjectFile, disasm::DisasmBinary};
 
@@ -20,6 +21,7 @@ pub struct Ui {
     trace_panel_open: bool,
     fullscreen: bool,
     symbol_filter: String,
+    symbol_matcher: SkimMatcherV2,
 }
 
 impl Ui {
@@ -34,6 +36,7 @@ impl Ui {
             trace_panel_open: false,
             fullscreen: false,
             symbol_filter: String::new(),
+            symbol_matcher: SkimMatcherV2::default(),
         }
     }
 
@@ -130,15 +133,18 @@ impl Ui {
                         self.symbol_panel_open = !self.symbol_panel_open;
                     }
 
-                    let active_element = if let Some(file) = self.app.get_active_obj_name()
+                    if let Some(file) = self.app.get_active_obj_name()
                         && let Some(sym) = self.app.get_active_sym_name()
                     {
-                        format!("{} > {}", file, sym)
+                        ui.horizontal(|ui| {
+                            ui.label(file);
+                            ui.label(RichText::new(">").weak());
+                            ui.label(sym);
+                        });
                     } else {
-                        "Nothing selected".into()
+                        ui.label("Nothing selected");
                     };
 
-                    ui.label(active_element);
                     ui.separator();
 
                     // Right hamburger — toggles trace panel

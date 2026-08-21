@@ -1,6 +1,7 @@
 use egui::{Color32, Context, RichText};
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 
-use crate::truncate_middle;
+use crate::{disasm::DisasmFunction, truncate_middle};
 
 pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
     egui::SidePanel::left("sym_panel")
@@ -11,7 +12,7 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
             // ---------- Header ----------
             ui.add(
                 egui::TextEdit::singleline(&mut ui_app.symbol_filter)
-                    .hint_text("Search symbols...")
+                    .hint_text("Search symbols... (name, or 0x hex address)")
                     .desired_width(f32::INFINITY),
             );
 
@@ -23,20 +24,17 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
             let mut footer_rect = ui.available_rect_before_wrap();
             footer_rect.min.y = footer_rect.max.y - footer_height;
+
+            let matcher = &ui_app.symbol_matcher;
+
             ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.set_width(ui.available_width());
 
-                    let filter = ui_app.symbol_filter.trim().to_ascii_lowercase();
+                    let filter = ui_app.symbol_filter.trim();
 
                     for (file_idx, file) in &mut ui_app.app.objects.iter().enumerate() {
-                        let matching: Vec<_> = file
-                            .disasm
-                            .functions()
-                            .filter(|sym| {
-                                filter.is_empty() || sym.name.to_ascii_lowercase().contains(&filter)
-                            })
-                            .collect();
+                        let matching = filter_symbols(file.disasm.functions(), filter, &matcher);
 
                         if matching.is_empty() {
                             continue;
@@ -154,4 +152,69 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                 }
             });
         });
+}
+
+/// Filter and rank a file's symbols against the user's search text.
+///
+/// - Empty filter: returns every symbol, unranked.
+/// - Filter parses as a hex address (with or without `0x`/`0X` prefix):
+///   returns symbols whose range contains that address, tightest match first.
+/// - Otherwise: fuzzy-matches against symbol names, best match first.
+fn filter_symbols<'a>(
+    functions: impl Iterator<Item = DisasmFunction<'a>>,
+    filter: &str,
+    matcher: &SkimMatcherV2,
+) -> Vec<DisasmFunction<'a>> {
+    if filter.is_empty() {
+        return functions.collect();
+    }
+
+    if let Some(addr) = parse_hex_addr(filter) {
+        let mut matches: Vec<_> = functions.filter(|f| f.contains(addr)).collect();
+        matches.sort_by_key(|f| f.size);
+        return matches;
+    }
+
+    let functions: Vec<_> = functions.collect();
+
+    // Primary: fast, order-preserving subsequence matching.
+    let mut scored: Vec<(i64, usize)> = functions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| matcher.fuzzy_match(&f.name, filter).map(|score| (score, i)))
+        .collect();
+
+    if !scored.is_empty() {
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        return scored.into_iter().map(|(_, i)| functions[i]).collect();
+    }
+
+    // Fallback: nothing subsequence-matched — try typo-tolerant matching
+    // instead, in case the filter has a transposition/substitution/typo.
+    const TYPO_THRESHOLD: f64 = 0.75;
+    let filter_lower = filter.to_lowercase();
+    let mut typo_scored: Vec<(f64, usize)> = functions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| {
+            let score = strsim::jaro_winkler(&f.name.to_lowercase(), &filter_lower);
+            (score > TYPO_THRESHOLD).then_some((score, i))
+        })
+        .collect();
+    typo_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    typo_scored
+        .into_iter()
+        .map(|(_, i)| functions[i].clone())
+        .collect()
+}
+
+/// Parse `filter` as a hex address, accepting an optional `0x`/`0X` prefix
+/// (e.g. "1a2b", "0x1a2b", "0X1A2B" all parse to the same value).
+fn parse_hex_addr(filter: &str) -> Option<u64> {
+    let hex_part = filter
+        .strip_prefix("0x")
+        .or_else(|| filter.strip_prefix("0X"))
+        .unwrap_or(filter);
+
+    u64::from_str_radix(hex_part, 16).ok()
 }
