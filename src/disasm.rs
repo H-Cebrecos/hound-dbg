@@ -70,11 +70,53 @@ impl DisasmInstr {
     }
 }
 
+/// One raw symbol observed at a given address, before canonical-name
+/// resolution. Carries just enough concreteness info to rank it.
+struct SymbolAlias {
+    name: String,
+    /// True if the symbol's kind was explicitly `SymbolKind::Text` (compiler-
+    /// declared), false if it was accepted only because it sits in a text
+    /// section with `SymbolKind::Unknown` (assembly without `.type`).
+    explicit_type: bool,
+    /// `Some(size)` if the symbol carried a nonzero `.size`; `None` if it
+    /// was missing (assembly without `.size`) and would need inference.
+    explicit_size: Option<u64>,
+}
+
+/// Rank used to pick the canonical alias at an address — lower sorts first
+/// and is preferred as canonical. Primary criteria are how much concrete
+/// data the compiler/assembler actually gave us (explicit type, explicit
+/// size); name shape is only a tiebreak among equally concrete aliases.
+fn alias_rank(alias: &SymbolAlias) -> (bool, bool, usize, bool, usize, &str) {
+    let (leading_underscores, is_versioned, len) = name_shape(&alias.name);
+    (
+        !alias.explicit_type,          // explicitly typed sorts before inferred
+        alias.explicit_size.is_none(), // explicit size sorts before missing
+        leading_underscores,
+        is_versioned,
+        len,
+        alias.name.as_str(), // final tiebreak: deterministic ordering
+    )
+}
+
+/// Name-shape signal, used only to break ties between equally concrete
+/// aliases (e.g. two compiler-declared symbols at the same address).
+fn name_shape(name: &str) -> (usize, bool, usize) {
+    let leading_underscores = name.chars().take_while(|&c| c == '_').count();
+    let is_versioned = name.contains('@');
+    (leading_underscores, is_versioned, name.len())
+}
+
 /// Decoded instruction sequence for a single symbol.
 #[derive(Debug, Clone, Copy)]
 pub struct DisasmFunction<'a> {
-    /// Symbol name.
-    pub name: &'a str, // borrows from the metadata vec
+    /// Canonical display name, the most "normal-looking" of any aliases
+    /// sharing this address. See `canonical_name_rank`.
+    pub name: &'a str,
+
+    /// All symbol names observed at this address, including `name` itself,
+    /// ordered by canonicalness (most canonical first).
+    pub aliases: &'a [String],
 
     /// Entry point address.
     pub addr: u64,
@@ -82,6 +124,15 @@ pub struct DisasmFunction<'a> {
     pub size: u64,
 
     instructions: &'a [DisasmInstr],
+}
+
+//NOTE: this exists to avoid cyclical deps
+struct FunctionEntry {
+    addr: u64,
+    range: Range<usize>,
+    /// All names sharing this address, canonical-rank order (names[0] is
+    /// the canonical/display name).
+    names: Vec<String>,
 }
 
 impl DisasmFunction<'_> {
@@ -127,9 +178,9 @@ pub struct DisasmBinary {
     // flat sorted index over all instructions for O(log n) address lookup
     index: Vec<DisasmInstr>,
 
-    /// Symbol metadata. Each entry references a contiguous slice of `index`.
-    /// Stored as (name, addr, range_in_index) to avoid self-referential structs.
-    functions: Vec<(String, u64, Range<usize>)>,
+    /// One entry per unique address that has at least one function symbol.
+    /// `names` holds every alias observed at that address, canonical first.
+    functions: Vec<FunctionEntry>,
 
     /// Source program lines
     debug_info: Option<addr2line::Loader>,
@@ -190,26 +241,19 @@ impl DisasmBinary {
             }
         };
 
-        // First pass: collect all function-symbol addresses so we can use them
-        // as boundaries when a symbol is missing an explicit `.size`.
-        let mut symbol_addrs: Vec<u64> = obj
-            .symbols()
-            .filter(|sym| sym.is_definition() && symbol_looks_like_function(&obj, sym))
-            .map(|sym| sym.address())
-            .collect();
-        symbol_addrs.sort_unstable();
-        symbol_addrs.dedup();
-
-        let mut functions = Vec::new();
+        // First pass: group every function-like symbol by address, preserving
+        // per-symbol concreteness (explicit type/size vs. inferred). Multiple
+        // symbols legitimately share an address (weak/strong alias pairs,
+        // versioned symbols, multiple assembly entry labels) — we keep all of
+        // them as searchable aliases rather than dropping any.
+        let mut by_addr: std::collections::HashMap<u64, Vec<SymbolAlias>> =
+            std::collections::HashMap::new();
 
         for sym in obj.symbols() {
             if !sym.is_definition() {
                 continue;
             }
 
-            // Accept symbols explicitly typed as functions, *or* untyped symbols
-            // that live in a text section as hand-written assembly frequently
-            // omits `.type`/`.size` directives that compilers always emit.
             if !symbol_looks_like_function(&obj, &sym) {
                 continue;
             }
@@ -225,39 +269,62 @@ impl DisasmBinary {
                 continue;
             }
 
-            let addr = sym.address();
+            by_addr.entry(sym.address()).or_default().push(SymbolAlias {
+                name,
+                explicit_type: sym.kind() == SymbolKind::Text,
+                explicit_size: (sym.size() != 0).then_some(sym.size()),
+            });
+        }
 
-            // Size may be missing (no `.size` directive). Fall back to computing
-            // it from the next known symbol boundary rather than dropping the
-            // symbol outright.
-            let size = if sym.size() != 0 {
-                sym.size()
-            } else {
-                let estimated = {
-                    // Estimate a symbol's size when no explicit `.size` directive was given,
-                    // by finding the address of the next known symbol after it (or the end
-                    // of its containing section, if it's the last symbol in that section).
-                    let section_end = sections
-                        .iter()
-                        .find(|s| addr >= s.address() && addr < s.address() + s.size())
-                        .map(|s| s.address() + s.size());
+        let mut sorted_addrs: Vec<u64> = by_addr.keys().copied().collect();
+        sorted_addrs.sort_unstable();
 
-                    let idx = symbol_addrs.partition_point(|&a| a <= addr);
-                    let next_symbol = symbol_addrs.get(idx).copied();
+        let mut functions = Vec::new();
 
-                    match (next_symbol, section_end) {
-                        (Some(n), Some(e)) => n.min(e) - addr,
-                        (Some(n), None) => n - addr,
-                        (None, Some(e)) => e - addr,
-                        (None, None) => 0,
-                    }
-                };
+        for &addr in &sorted_addrs {
+            let mut aliases = by_addr.remove(&addr).unwrap();
 
-                estimated
+            // Canonical alias = the one backed by the most concrete compiler/
+            // assembler-provided data; name shape only breaks ties.
+            aliases.sort_by(|a, b| alias_rank(a).cmp(&alias_rank(b)));
+
+            // Prefer size from the most concrete alias that actually has one —
+            // aliases are already sorted by concreteness, so the first
+            // `explicit_size` we find is the best available. Only fall back to
+            // inference (still needed for hand-written assembly with no
+            // `.size` on *any* alias at this address) if none had one.
+            let size = match aliases.iter().find_map(|a| a.explicit_size) {
+                Some(size) => size,
+                None => {
+                    let estimated = {
+                        // Estimate a symbol's size when no explicit `.size` directive was given,
+                        // by finding the address of the next known symbol after it (or the end
+                        // of its containing section, if it's the last symbol in that section).
+                        let section_end = sections
+                            .iter()
+                            .find(|s| addr >= s.address() && addr < s.address() + s.size())
+                            .map(|s| s.address() + s.size());
+
+                        let idx = sorted_addrs.partition_point(|&a| a <= addr);
+                        let next_symbol = sorted_addrs.get(idx).copied();
+
+                        match (next_symbol, section_end) {
+                            (Some(n), Some(e)) => n.min(e) - addr,
+                            (Some(n), None) => n - addr,
+                            (None, Some(e)) => e - addr,
+                            (None, None) => 0,
+                        }
+                    };
+
+                    estimated
+                }
             };
 
             if size == 0 {
-                eprintln!("symbol {name} at {addr:#x} has no determinable size, skipping");
+                eprintln!(
+                    "symbol {} at {addr:#x} has no determinable size, skipping",
+                    aliases[0].name
+                );
                 continue;
             }
 
@@ -272,10 +339,15 @@ impl DisasmBinary {
 
             debug_assert!(
                 start_idx >= index.len() || index[start_idx].addr == addr,
-                "symbol {name} at {addr:#x} doesn't land on an instruction boundary"
+                "symbol {} at {addr:#x} doesn't land on an instruction boundary",
+                aliases[0].name
             );
 
-            functions.push((name, addr, start_idx..end_idx));
+            functions.push(FunctionEntry {
+                addr,
+                range: start_idx..end_idx,
+                names: aliases.into_iter().map(|a| a.name).collect(),
+            });
         }
 
         Ok(Self {
@@ -285,40 +357,43 @@ impl DisasmBinary {
         })
     }
 
-    /// Look up a function by symbol name.
+    /// Look up a function by any of its symbol names (canonical or alias).
     pub fn function_by_name(&self, name: &str) -> Option<DisasmFunction<'_>> {
-        let (fn_name, addr, range) = self.functions.iter().find(|(n, _, _)| n == name)?;
+        let entry = self
+            .functions
+            .iter()
+            .find(|e| e.names.iter().any(|n| n == name))?;
         Some(DisasmFunction {
-            name: fn_name,
-            addr: *addr,
-            size: self.function_size(range),
-            instructions: &self.index[range.clone()],
+            name: &entry.names[0],
+            aliases: &entry.names,
+            addr: entry.addr,
+            size: self.function_size(&entry.range),
+            instructions: &self.index[entry.range.clone()],
         })
     }
 
     /// Look up a function by its entry point address.
     pub fn function_at_addr(&self, addr: u64) -> Option<DisasmFunction<'_>> {
-        let (fn_name, fn_addr, range) = self.functions.iter().find(|(_, a, _)| *a == addr)?;
+        let entry = self.functions.iter().find(|e| e.addr == addr)?;
         Some(DisasmFunction {
-            name: fn_name,
-            addr: *fn_addr,
-            size: self.function_size(range),
-            instructions: &self.index[range.clone()],
+            name: &entry.names[0],
+            aliases: &entry.names,
+            addr: entry.addr,
+            size: self.function_size(&entry.range),
+            instructions: &self.index[entry.range.clone()],
         })
     }
 
-    /// Iterate over all decoded functions.
+    /// Iterate over all decoded functions (one entry per unique address).
     pub fn functions(&self) -> impl Iterator<Item = DisasmFunction<'_>> {
-        self.functions
-            .iter()
-            .map(|(name, addr, range)| DisasmFunction {
-                name,
-                addr: *addr,
-                size: self.function_size(range),
-                instructions: &self.index[range.clone()],
-            })
+        self.functions.iter().map(|entry| DisasmFunction {
+            name: &entry.names[0],
+            aliases: &entry.names,
+            addr: entry.addr,
+            size: self.function_size(&entry.range),
+            instructions: &self.index[entry.range.clone()],
+        })
     }
-
     /// Return the instruction at exactly the given address, if any.
     pub fn instruction_at(&self, addr: u64) -> Option<&DisasmInstr> {
         let idx = self.index.binary_search_by_key(&addr, |i| i.addr).ok()?;

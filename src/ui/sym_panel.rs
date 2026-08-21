@@ -12,7 +12,7 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
             // ---------- Header ----------
             ui.add(
                 egui::TextEdit::singleline(&mut ui_app.symbol_filter)
-                    .hint_text("Search symbols... (name, or 0x hex address)")
+                    .hint_text("Search symbols... (name, alias, or address)")
                     .desired_width(f32::INFINITY),
             );
 
@@ -25,8 +25,6 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
             let mut footer_rect = ui.available_rect_before_wrap();
             footer_rect.min.y = footer_rect.max.y - footer_height;
 
-            let matcher = &ui_app.symbol_matcher;
-
             ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -34,7 +32,8 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                     let filter = ui_app.symbol_filter.trim();
 
                     for (file_idx, file) in &mut ui_app.app.objects.iter().enumerate() {
-                        let matching = filter_symbols(file.disasm.functions(), filter, &matcher);
+                        let matching =
+                            filter_symbols(file.disasm.functions(), filter, &ui_app.symbol_matcher);
 
                         if matching.is_empty() {
                             continue;
@@ -50,7 +49,7 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                         if let Some(active) = ui_app.app.active_file
                             && active == file_idx
                         {
-                            file_text = file_text.color(super::THEME.sky);
+                            file_text = file_text.color(super::THEME.mauve);
                         }
                         egui::CollapsingHeader::new(file_text)
                             .id_salt(id)
@@ -58,7 +57,7 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                             .show(ui, |ui| {
                                 for sym in matching {
                                     let mut text = RichText::new(truncate_middle(
-                                        &sym.name,
+                                        sym.name,
                                         (ui.available_width() / 8.) as usize,
                                     ))
                                     .weak();
@@ -69,25 +68,54 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                         if let Some(active) = ui_app.app.active_file
                                             && active == file_idx
                                         {
-                                            text = text.strong().color(super::THEME.sky);
+                                            text = text.strong().color(super::THEME.mauve);
                                         }
                                     }
 
+                                    let extra_aliases = sym.aliases.len().saturating_sub(1);
+
                                     let response = ui
-                                        .selectable_label(false, text)
+                                        .horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            let label = ui.selectable_label(false, text);
+
+                                            if extra_aliases > 0 {
+                                                ui.label(
+                                                    RichText::new(format!("+{extra_aliases}"))
+                                                        .weak()
+                                                        .color(
+                                                            super::THEME
+                                                                .overlay1
+                                                                .gamma_multiply(0.5),
+                                                        ),
+                                                );
+                                            }
+
+                                            label
+                                        })
+                                        .inner
                                         //this instead of on_hover_text to prevent very long symbol names from wrapping as well as for multi-color
                                         .on_hover_ui(|ui| {
-                                            ui.set_max_width(f32::MAX);
-
                                             ui.horizontal(|ui| {
                                                 ui.label(
                                                     RichText::new(format!("0x{:x}:", sym.addr))
-                                                        .weak()
-                                                        .monospace(),
+                                                        .weak(),
                                                 );
 
                                                 ui.label(sym.name);
                                             });
+
+                                            if extra_aliases > 0 {
+                                                ui.separator();
+                                                ui.label(
+                                                    RichText::new("Also known as:")
+                                                        .weak()
+                                                        .italics(),
+                                                );
+                                                for alias in sym.aliases.get(1..).unwrap_or(&[]) {
+                                                    ui.label(RichText::new(alias));
+                                                }
+                                            }
                                         });
 
                                     response.context_menu(|ui| {
@@ -97,6 +125,12 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
                                         if ui.button("Copy symbol address").clicked() {
                                             ui.ctx().copy_text(format!("{:x}", sym.addr));
+                                        }
+
+                                        if extra_aliases > 0
+                                            && ui.button("Copy all aliases").clicked()
+                                        {
+                                            ui.ctx().copy_text(sym.aliases.join("\n"));
                                         }
 
                                         //TODO: show greyed out if no trace is loaded
@@ -177,11 +211,20 @@ fn filter_symbols<'a>(
 
     let functions: Vec<_> = functions.collect();
 
-    // Primary: fast, order-preserving subsequence matching.
+    // Primary: fast, order-preserving subsequence matching, checked against
+    // the canonical name and every alias — best score per symbol wins, so
+    // a symbol appears once even if a less-prominent alias is the match.
     let mut scored: Vec<(i64, usize)> = functions
         .iter()
         .enumerate()
-        .filter_map(|(i, f)| matcher.fuzzy_match(&f.name, filter).map(|score| (score, i)))
+        .filter_map(|(i, f)| {
+            let best = f
+                .aliases
+                .iter()
+                .filter_map(|name| matcher.fuzzy_match(name, filter))
+                .max();
+            best.map(|score| (score, i))
+        })
         .collect();
 
     if !scored.is_empty() {
@@ -190,22 +233,24 @@ fn filter_symbols<'a>(
     }
 
     // Fallback: nothing subsequence-matched — try typo-tolerant matching
-    // instead, in case the filter has a transposition/substitution/typo.
+    // instead, in case the filter has a transposition/substitution/typo
+    // relative to the canonical name or one of its aliases.
     const TYPO_THRESHOLD: f64 = 0.75;
     let filter_lower = filter.to_lowercase();
     let mut typo_scored: Vec<(f64, usize)> = functions
         .iter()
         .enumerate()
         .filter_map(|(i, f)| {
-            let score = strsim::jaro_winkler(&f.name.to_lowercase(), &filter_lower);
-            (score > TYPO_THRESHOLD).then_some((score, i))
+            let best = f
+                .aliases
+                .iter()
+                .map(|name| strsim::jaro_winkler(&name.to_lowercase(), &filter_lower))
+                .fold(0.0_f64, f64::max);
+            (best > TYPO_THRESHOLD).then_some((best, i))
         })
         .collect();
     typo_scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    typo_scored
-        .into_iter()
-        .map(|(_, i)| functions[i].clone())
-        .collect()
+    typo_scored.into_iter().map(|(_, i)| functions[i]).collect()
 }
 
 /// Parse `filter` as a hex address, accepting an optional `0x`/`0X` prefix
