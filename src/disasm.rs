@@ -142,9 +142,8 @@ impl DisasmBinary {
             Err(err) => return Err(DisasmError::IoError(err)),
         };
 
-        let Ok(obj) = object::File::parse(&*data) else {
-            return Err(DisasmError::UnsupportedFormat);
-        };
+        let obj =
+            object::File::parse(&*data).map_err(|e| DisasmError::ParseError(e.to_string()))?;
 
         let mut sections: Vec<_> = obj
             .sections()
@@ -156,13 +155,12 @@ impl DisasmBinary {
         let engine = CapstoneBackend::new(obj.architecture());
         let mut index: Vec<DisasmInstr> = Vec::new();
         for sec in &sections {
-            let Ok(data) = sec.data() else {
-                return Err(DisasmError::BackendError(format!(
-                    "section {:?} at {:#x} has no data",
-                    sec.name().unwrap_or("<unnamed>"),
-                    sec.address(),
-                )));
-            };
+            let data = sec.data().map_err(|e| {
+                DisasmError::BackendError(format!(
+                    "failed to read section {:?} data: {e}",
+                    sec.name().unwrap_or("<unnamed>")
+                ))
+            })?;
 
             let instructions = engine.decode(data, sec.address()).map_err(|e| {
                 DisasmError::BackendError(format!(
@@ -175,13 +173,6 @@ impl DisasmBinary {
                 ))
             })?;
 
-            eprintln!(
-                "decoded {} instrs from section at {:#x}, {} bytes",
-                instructions.len(),
-                sec.address(),
-                data.len()
-            );
-
             index.extend(instructions);
         }
 
@@ -190,24 +181,40 @@ impl DisasmBinary {
             "index is not sorted by address"
         );
 
+        let debug_info = match addr2line::Loader::new(path) {
+            Ok(loader) => Some(loader),
+            Err(e) => {
+                eprintln!("failed to load debug info for {}: {e}", path.display());
+                None
+            }
+        };
+
+        // First pass: collect all function-symbol addresses so we can use them
+        // as boundaries when a symbol is missing an explicit `.size`.
+        let mut symbol_addrs: Vec<u64> = obj
+            .symbols()
+            .filter(|sym| sym.is_definition() && symbol_looks_like_function(&obj, sym))
+            .map(|sym| sym.address())
+            .collect();
+        symbol_addrs.sort_unstable();
+        symbol_addrs.dedup();
+
         let mut functions = Vec::new();
 
-        let debug_info = addr2line::Loader::new(path).ok();
-
         for sym in obj.symbols() {
-            // Only defined code symbols — this alone kills most non-function noise:
-            // excludes data (SymbolKind::Data), section symbols, file symbols,
-            // undefined/imported symbols (is_definition() is false for those),
-            // and debug/other symbol kinds.
-            if sym.kind() != SymbolKind::Text || !sym.is_definition() {
+            if !sym.is_definition() {
                 continue;
             }
 
-            if sym.size() == 0 {
+            // Accept symbols explicitly typed as functions, *or* untyped symbols
+            // that live in a text section as hand-written assembly frequently
+            // omits `.type`/`.size` directives that compilers always emit.
+            if !symbol_looks_like_function(&obj, &sym) {
                 continue;
             }
 
             let Ok(name) = sym.name() else {
+                eprintln!("symbol at {:#x} has unreadable name", sym.address());
                 continue;
             };
 
@@ -217,23 +224,57 @@ impl DisasmBinary {
                 continue;
             }
 
+            let addr = sym.address();
+
+            // Size may be missing (no `.size` directive). Fall back to computing
+            // it from the next known symbol boundary rather than dropping the
+            // symbol outright.
+            let size = if sym.size() != 0 {
+                sym.size()
+            } else {
+                let estimated = {
+                    // Estimate a symbol's size when no explicit `.size` directive was given,
+                    // by finding the address of the next known symbol after it (or the end
+                    // of its containing section, if it's the last symbol in that section).
+                    let section_end = sections
+                        .iter()
+                        .find(|s| addr >= s.address() && addr < s.address() + s.size())
+                        .map(|s| s.address() + s.size());
+
+                    let idx = symbol_addrs.partition_point(|&a| a <= addr);
+                    let next_symbol = symbol_addrs.get(idx).copied();
+
+                    match (next_symbol, section_end) {
+                        (Some(n), Some(e)) => n.min(e) - addr,
+                        (Some(n), None) => n - addr,
+                        (None, Some(e)) => e - addr,
+                        (None, None) => 0,
+                    }
+                };
+
+                estimated
+            };
+
+            if size == 0 {
+                eprintln!("symbol {name} at {addr:#x} has no determinable size, skipping");
+                continue;
+            }
+
             let start_idx = index
-                .binary_search_by_key(&sym.address(), |i| i.addr)
+                .binary_search_by_key(&addr, |i| i.addr)
                 .unwrap_or_else(|insert_pos| insert_pos);
 
-            let end_addr = sym.address() + sym.size();
+            let end_addr = addr + size;
             let end_idx = index
                 .binary_search_by_key(&end_addr, |i| i.addr)
                 .unwrap_or_else(|insert_pos| insert_pos);
 
             debug_assert!(
-                start_idx >= index.len() || index[start_idx].addr == sym.address(),
-                "symbol {} at {:#x} doesn't land on an instruction boundary",
-                name,
-                sym.address()
+                start_idx >= index.len() || index[start_idx].addr == addr,
+                "symbol {name} at {addr:#x} doesn't land on an instruction boundary"
             );
 
-            functions.push((name, sym.address(), start_idx..end_idx));
+            functions.push((name, addr, start_idx..end_idx));
         }
 
         Ok(Self {
@@ -366,6 +407,23 @@ impl DisasmBinary {
         todo!()
 
         // is this made redundant by the next address? we need to keep one or the other, this one has actual context.
+    }
+}
+
+/// Whether a symbol should be treated as a function definition: either
+/// explicitly typed as such, or untyped but living in a text section
+/// (common in hand-written assembly that omits `.type` directives).
+fn symbol_looks_like_function(obj: &object::File, sym: &object::Symbol) -> bool {
+    let in_text_section = sym
+        .section_index()
+        .and_then(|idx| obj.section_by_index(idx).ok())
+        .map(|sec| sec.kind() == SectionKind::Text)
+        .unwrap_or(false);
+
+    match sym.kind() {
+        SymbolKind::Text => true,
+        SymbolKind::Unknown if in_text_section => true,
+        _ => false,
     }
 }
 
@@ -567,7 +625,7 @@ pub enum DisasmError {
     IoError(std::io::Error),
 
     /// The object file format is not supported.
-    UnsupportedFormat,
+    ParseError(String),
 
     /// The target architecture is not supported.
     UnsupportedArchitecture(Architecture),
