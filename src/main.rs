@@ -31,25 +31,30 @@ fn truncate_middle(s: &str, max: usize) -> String {
 }
 
 type ObjectIndex = usize;
+/// Which function is currently selected for display in the disassembly panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    obj: ObjectIndex,
+    addr: u64,
+}
 
 struct App {
-    // Note: the disassembler is part of the object, as we technically can have mixed architecture systems e.g. ARM32 coexisting with ARM64.
+    // Note: the disassembler is part of the object, as we technically can
+    // have mixed architecture systems e.g. ARM32 coexisting with ARM64.
     objects: Vec<ObjectFile>,
-
-    active_sym: Option<u64>,
-    active_file: Option<ObjectIndex>, //TODO: these should likely be refs.
+    active: Option<Selection>,
 }
 
 impl App {
     pub fn get_active_sym_name(&self) -> Option<&str> {
-        let file_idx = self.active_file?;
-        let addr = self.active_sym?;
+        let file_idx = self.active?.obj;
+        let addr = self.active?.addr;
         let func = self.objects.get(file_idx)?.disasm.function_at_addr(addr)?;
         Some(func.name)
     }
 
     pub fn get_active_obj_name(&self) -> Option<&str> {
-        let file_idx = self.active_file?;
+        let file_idx = self.active?.obj;
         Some(&self.objects.get(file_idx)?.name)
     }
 }

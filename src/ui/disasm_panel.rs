@@ -22,20 +22,21 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
                     }
                 }
             });
-        } else if ui_app.app.active_sym.is_some() {
+        } else if ui_app.app.active.is_some() {
             egui::ScrollArea::vertical()
                 .id_salt("disasm_scroll")
                 .show(ui, |ui| {
                     ui.set_min_width(400.);
-                    let (Some(file_idx), Some(addr)) =
-                        (ui_app.app.active_file, ui_app.app.active_sym)
-                    else {
+                    let Some(sel) = ui_app.app.active else {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(RichText::new("no symbol selected").italics().weak());
+                        });
                         return;
                     };
-                    let Some(obj) = ui_app.app.objects.get(file_idx) else {
+                    let Some(obj) = ui_app.app.objects.get_mut(sel.obj) else {
                         return;
                     };
-                    let Some(func) = obj.disasm.function_at_addr(addr) else {
+                    let Some(func) = obj.disasm.function_at_addr(sel.addr) else {
                         return;
                     };
 

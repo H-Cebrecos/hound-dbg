@@ -29,8 +29,7 @@ impl Ui {
         Ui {
             app: App {
                 objects: Vec::new(),
-                active_sym: None,
-                active_file: None,
+                active: None,
             },
             symbol_panel_open: false,
             trace_panel_open: false,
