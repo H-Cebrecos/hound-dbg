@@ -94,13 +94,23 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.add_space(10.);
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "{} functions",
-                                            obj.disasm.functions().count()
-                                        ))
-                                        .weak(),
+
+                                    let count_text =
+                                        format!("{} functions", obj.disasm.functions().count());
+
+                                    // Measure how wide the count label would be, without drawing it,
+                                    // so we can decide whether it fits before committing to show it.
+                                    let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                    let galley = ui.painter().layout_no_wrap(
+                                        count_text.clone(),
+                                        font_id,
+                                        ui.visuals().text_color(),
                                     );
+
+                                    // Avoid function count overlapping the object name.
+                                    if ui.available_width() > galley.size().x {
+                                        ui.label(RichText::new(count_text).weak());
+                                    }
                                 },
                             );
                         })
