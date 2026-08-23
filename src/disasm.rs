@@ -147,7 +147,7 @@ impl DisasmFunction<'_> {
     }
 
     pub fn contains(&self, addr: u64) -> bool {
-        addr >= self.addr && addr <= self.end_addr()
+        addr >= self.addr && addr < self.end_addr()
     }
 }
 
