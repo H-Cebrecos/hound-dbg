@@ -8,26 +8,7 @@ mod disasm;
 struct ObjectFile {
     name: String,
     disasm: DisasmBinary,
-}
-
-fn truncate_middle(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_owned();
-    }
-
-    let keep = (max - 1) / 2;
-
-    format!(
-        "{}…{}",
-        s.chars().take(keep).collect::<String>(),
-        s.chars()
-            .rev()
-            .take(keep)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>(),
-    )
+    pub breakpoints: std::collections::HashSet<u64>,
 }
 
 type ObjectIndex = usize;

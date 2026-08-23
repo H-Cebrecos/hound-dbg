@@ -24,6 +24,7 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
             });
         } else if ui_app.app.active.is_some() {
             egui::ScrollArea::vertical()
+                .auto_shrink([true, false])
                 .id_salt("disasm_scroll")
                 .show(ui, |ui| {
                     ui.set_min_width(400.);
@@ -42,7 +43,11 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
                     // One Vec<DepthCell> per row, collected across the whole function first.
                     let mut rows: Vec<Vec<DepthCell>> = Vec::new();
+                    let disasm = &obj.disasm;
+                    let breakpoints = &mut obj.breakpoints;
+
                     let marker_width = 10.0;
+
                     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
 
                     egui::Grid::new("disasm_grid")
@@ -52,18 +57,52 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
                         .show(ui, |ui| {
                             let mut last_chain: Vec<(String, u32)> = Vec::new();
 
-                            for instr in &func {
-                                let frames = obj.disasm.frames_for_addr(instr.addr);
+                            for (row_idx, instr) in (&func).into_iter().enumerate() {
+                                let frames = disasm.frames_for_addr(instr.addr);
 
                                 let instr_text = instr.text.split(':').next_back().unwrap().trim();
                                 let mut parts = instr_text.splitn(2, char::is_whitespace);
                                 let mnemonic = parts.next().unwrap_or("");
                                 let operands = parts.next().unwrap_or("").trim();
 
-                                ui.label(RichText::new(format!("{:08x}", instr.addr)).weak());
-                                ui.label(
-                                    RichText::new(mnemonic).monospace().color(super::THEME.blue),
-                                );
+                                // ---------- Breakpoint gutter + address, tightly grouped ----------
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+
+                                    let bp_size = 14.0; // fixed, independent of text height
+                                    let (bp_rect, bp_response) = ui.allocate_exact_size(
+                                        egui::vec2(bp_size, row_height),
+                                        egui::Sense::click(),
+                                    );
+                                    let has_bp = breakpoints.contains(&instr.addr);
+                                    if has_bp {
+                                        ui.painter().circle_filled(
+                                            bp_rect.center(),
+                                            4.0,
+                                            super::THEME.red,
+                                        );
+                                    } else if bp_response.hovered() {
+                                        ui.painter().circle_stroke(
+                                            bp_rect.center(),
+                                            4.0,
+                                            egui::Stroke::new(
+                                                1.0,
+                                                super::THEME.red.gamma_multiply(0.5),
+                                            ),
+                                        );
+                                    }
+                                    if bp_response.clicked() {
+                                        if has_bp {
+                                            breakpoints.remove(&instr.addr);
+                                        } else {
+                                            breakpoints.insert(instr.addr);
+                                        }
+                                    }
+
+                                    ui.label(RichText::new(format!("{:08x}", instr.addr)).weak());
+                                });
+
+                                ui.label(RichText::new(mnemonic).color(super::THEME.blue));
                                 ui.label(operands);
 
                                 let chain: Vec<(String, u32)> = frames
@@ -112,27 +151,17 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                         cells.push(DepthCell { rect, is_new });
                                     }
                                 });
-                                //TODO: UX can be improved here
-                                if !hover_lines.is_empty() {
-                                    let hover_text = hover_lines.join("\n");
-                                    ui.label("").on_hover_text(hover_text.clone()).context_menu(
-                                        |ui| {
-                                            if ui.button("Copy").clicked() {
-                                                ui.ctx().copy_text(hover_text.clone());
-                                                ui.close();
-                                            }
-                                        },
-                                    );
-                                }
+
                                 ui.end_row();
                                 last_chain = chain;
                                 rows.push(cells);
+                                // row_idx currently unused beyond enumerate bookkeeping;
+                                // kept for clarity/debuggability if needed later.
+                                let _ = row_idx;
                             }
                         });
 
-                    // Second pass: for each depth, draw one continuous vertical segment per
-                    // run — starting at a '-' row, extending through consecutive rows that
-                    // still reach that depth, stopping when the chain no longer does.
+                    // ---------- Second pass: call-chain depth connectors (unchanged) ----------
                     let painter = ui.painter();
                     let max_depth = rows.iter().map(|r| r.len()).max().unwrap_or(0);
 
@@ -253,7 +282,7 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
 struct DepthCell {
     rect: egui::Rect,
-    is_new: bool, // true = '-' (run starts here), false = '|' (continues)
+    is_new: bool, // true = 'dot' (run starts here), false = '|' (continues)
 }
 
 fn draw_run(

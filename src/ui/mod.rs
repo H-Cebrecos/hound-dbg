@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{collections::HashSet, path::Path};
 
 use eframe::NativeOptions;
 use egui::{FontData, FontDefinitions, FontFamily, RichText};
@@ -19,6 +19,7 @@ pub struct Ui {
     // GUI stuff
     symbol_panel_open: bool,
     trace_panel_open: bool,
+    break_panel_open: bool,
     fullscreen: bool,
     symbol_filter: String,
     symbol_matcher: SkimMatcherV2,
@@ -33,6 +34,7 @@ impl Ui {
             },
             symbol_panel_open: false,
             trace_panel_open: false,
+            break_panel_open: false,
             fullscreen: false,
             symbol_filter: String::new(),
             symbol_matcher: SkimMatcherV2::default(),
@@ -86,7 +88,11 @@ impl Ui {
             match DisasmBinary::load(path) {
                 Ok(disasm) => {
                     let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-                    self.app.objects.push(ObjectFile { name, disasm });
+                    self.app.objects.push(ObjectFile {
+                        name,
+                        disasm,
+                        breakpoints: HashSet::new(),
+                    });
                     self.symbol_panel_open = true;
                 }
                 Err(e) => eprintln!("{:?}", e),
@@ -127,6 +133,11 @@ impl Ui {
             .show_separator_line(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    // Left dot — toggles symbol panel
+                    if ui.button(RichText::new("●").size(24.)).clicked() {
+                        self.break_panel_open = !self.break_panel_open;
+                    }
+
                     // Left hamburger — toggles symbol panel
                     if ui.button(RichText::new("☰").size(24.)).clicked() {
                         self.symbol_panel_open = !self.symbol_panel_open;
@@ -165,6 +176,25 @@ impl eframe::App for Ui {
         self.handle_fullscreen(ctx);
         self.handle_drag_and_drop(ctx);
         self.show_top_bar(ctx);
+
+        egui::SidePanel::left("breakpoints")
+            .show_separator_line(true)
+            .resizable(true)
+            .default_width(400.0)
+            .show_animated(ctx, self.break_panel_open, |ui| {
+                ui.label("Breakpoints");
+                for obj in &mut self.app.objects {
+                    ui.label(&obj.name);
+                    for bp in &obj.breakpoints {
+                        let matches: Vec<_> =
+                            obj.disasm.functions().filter(|f| f.contains(*bp)).collect();
+
+                        if !matches.is_empty() {
+                            ui.label(matches[0].name);
+                        }
+                    }
+                }
+            });
 
         sym_panel::sym_panel(ctx, self);
         trace_panel::trace_panel(ctx, self);
