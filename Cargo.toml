@@ -17,3 +17,5 @@ ctxp = {git = "https://github.com/H-Cebrecos/ctxp-rs.git"}
 anyhow = "1.0.103"
 fuzzy-matcher = "0.3.7"
 strsim = "0.11.1"
+memmap2 = "0.9.11"
+fs4 = "1.1.0"

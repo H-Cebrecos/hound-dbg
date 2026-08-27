@@ -1,9 +1,12 @@
 mod ui;
+use std::fs::File;
+
 use ui::Ui;
 
-use crate::disasm::DisasmBinary;
+use crate::{disasm::DisasmBinary, trace_file::TraceFile};
 
 mod disasm;
+mod trace_file;
 
 struct ObjectFile {
     name: String,
@@ -24,6 +27,7 @@ struct App {
     // have mixed architecture systems e.g. ARM32 coexisting with ARM64.
     objects: Vec<ObjectFile>,
     active: Option<Selection>,
+    trace: Option<TraceFile>,
 }
 
 impl App {

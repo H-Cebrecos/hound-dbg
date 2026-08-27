@@ -118,7 +118,6 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                     .position(|(a, b)| a != b)
                                     .unwrap_or_else(|| last_chain.len().min(chain.len()));
 
-                                let hover_lines: Vec<String> = Vec::new();
                                 let mut cells: Vec<DepthCell> = Vec::new();
 
                                 ui.horizontal(|ui| {

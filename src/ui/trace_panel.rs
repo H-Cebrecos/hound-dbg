@@ -1,43 +1,35 @@
 use egui::{Context, RichText};
 
 pub fn trace_panel(ctx: &Context, ui_app: &mut super::Ui) {
-    egui::SidePanel::right("trace_panel")
+    if let Some(trace) = &ui_app.app.trace {
+        egui::SidePanel::right("trace_panel")
     .show_separator_line(false)
     .resizable(false)
     .default_width(400.0)
     .show_animated(ctx, ui_app.trace_panel_open, |ui| {
+        let trace_name = trace.path().file_stem().and_then(|s| s.to_str()).unwrap_or("Error parsing file name");
         ui.horizontal(|ui| {
-                   ui.checkbox(&mut true, "CPU0");
-                   ui.checkbox(&mut true, "CPU1");
-                   ui.checkbox(&mut false, "CPU2");
-                   ui.checkbox(&mut true, "CPU3");
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label(RichText::new(trace_name).strong());
+            ui.label(RichText::new("·").weak());
+            ui.label(RichText::new(format!("{} events", trace.event_count())).weak());
+        });
 
-                   ui.separator();
+        ui.horizontal(|ui| {
+            for src in trace.sources(){
+                if let Some(active) = ui_app.source_active.get_mut(&src.id) {
+                    ui.checkbox(active, &src.name);
+                }
+            }
+        });
 
-                   let linked = true;
-                   let text = if linked { "🔗" } else { "⛓" };
-
-                   _ = ui.selectable_label(linked, text);
-               });
-
-               ui.separator();
+        ui.separator();
 
                egui::ScrollArea::vertical()
                    .stick_to_bottom(true)
                    .show(ui, |ui| {
                        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
 
-                       ui.label(
-                           RichText::new("HDR:format=accemic//ctxp-txt,ver=1")
-                               .monospace()
-                               .color(super::THEME.subtext0),
-                       );
-
-                       ui.label(
-                           RichText::new(r#"META:#0="CPU0",#1="CPU1",#2="CPU2",#3="CPU3""#)
-                               .monospace()
-                               .color(super::THEME.subtext0),
-                       );
 
                        ui.label(
                            RichText::new("#0:MEMWRITE_1::0xfd7630b2a2ef6071")
@@ -72,4 +64,5 @@ pub fn trace_panel(ctx: &Context, ui_app: &mut super::Ui) {
                    });
 
     });
+    }
 }

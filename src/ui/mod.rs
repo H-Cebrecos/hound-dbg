@@ -1,10 +1,13 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use eframe::NativeOptions;
-use egui::{FontData, FontDefinitions, FontFamily, RichText};
+use egui::{FontData, FontDefinitions, FontFamily, Key::N, RichText};
 use fuzzy_matcher::skim::SkimMatcherV2;
 
-use crate::{App, ObjectFile, disasm::DisasmBinary};
+use crate::{App, ObjectFile, disasm::DisasmBinary, trace_file::TraceFile};
 
 mod disasm_panel;
 mod sym_panel;
@@ -23,6 +26,7 @@ pub struct Ui {
     fullscreen: bool,
     symbol_filter: String,
     symbol_matcher: SkimMatcherV2,
+    source_active: HashMap<u8, bool>,
 }
 
 impl Ui {
@@ -31,6 +35,7 @@ impl Ui {
             app: App {
                 objects: Vec::new(),
                 active: None,
+                trace: None,
             },
             symbol_panel_open: false,
             trace_panel_open: false,
@@ -38,6 +43,7 @@ impl Ui {
             fullscreen: false,
             symbol_filter: String::new(),
             symbol_matcher: SkimMatcherV2::default(),
+            source_active: HashMap::new(),
         }
     }
 
@@ -81,9 +87,15 @@ impl Ui {
 
         // Detect whether it is an object file or CTXP.
         if ctxp::Decoder::detect_format(path).is_ok() {
-            let _event_dec = ctxp::Decoder::open(path).unwrap();
-            //TODO: finish ctxp encoder so that we can generate a transcoder to text here.
-            //Store the event collection somewhere.
+            match TraceFile::load(path) {
+                Ok(trace) => {
+                    for src in trace.sources() {
+                        self.source_active.insert(src.id, true);
+                    }
+                    self.app.trace = Some(trace);
+                }
+                Err(e) => eprintln!("{:?}", e),
+            }
         } else {
             match DisasmBinary::load(path) {
                 Ok(disasm) => {
@@ -157,13 +169,15 @@ impl Ui {
 
                     ui.separator();
 
-                    // Right hamburger — toggles trace panel
                     //TODO: menu_button and menu_button_image exist and are likely very useful.
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(RichText::new("☰").size(24.)).clicked() {
-                            self.trace_panel_open = !self.trace_panel_open;
-                        }
-                    });
+                    // Right hamburger — toggles trace panel
+                    if self.app.trace.is_some() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button(RichText::new("☰").size(24.)).clicked() {
+                                self.trace_panel_open = !self.trace_panel_open;
+                            }
+                        });
+                    }
                 });
             });
     }
