@@ -28,11 +28,19 @@
 //!
 //! Clicking a symbol sets [`App::active`], which
 //! the disassembly panel reads to decide what to render.
+//!
+//! # Objects
+//!
+//! Object files are added from the panel footer (or by dropping them on the
+//! window) and unloaded from the ✕ on their header. Both paths go through
+//! [`Ui::open_file`](super::Ui::open_file) / [`Ui::remove_object`](super::Ui::remove_object)
+//! so that selections and caller searches stay consistent with the object
+//! list.
 
 use egui::{Color32, Context, RichText};
 use fuzzy_matcher::{skim::SkimMatcherV2, *};
 
-use crate::{Selection, disasm::DisasmFunction};
+use crate::{ObjectIndex, Selection, disasm::DisasmFunction};
 
 /// Render the symbol panel
 pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
@@ -56,6 +64,11 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
             let mut footer_rect = ui.available_rect_before_wrap();
             footer_rect.min.y = footer_rect.max.y - footer_height;
+
+            // Applied once the walk below has released its borrow on the
+            // object list.
+            let mut unload: Option<ObjectIndex> = None;
+            let mut find_callers: Option<(ObjectIndex, u64)> = None;
 
             // -------- Main View --------
             ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
@@ -89,10 +102,21 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                         // header styling
                         .show_header(ui, |ui| {
                             ui.label(obj_name.clone());
-                            // function count
+                            // unload button, then function count
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(RichText::new("✕").weak())
+                                                .frame(false),
+                                        )
+                                        .on_hover_text(format!("Unload {}", obj.name))
+                                        .clicked()
+                                    {
+                                        unload = Some(obj_idx);
+                                    }
+
                                     ui.add_space(10.);
 
                                     let count_text =
@@ -188,6 +212,13 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                         ui.ctx().copy_text(sym.aliases.join("\n"));
                                     }
 
+                                    ui.separator();
+
+                                    if ui.button("Find callers").clicked() {
+                                        find_callers = Some((obj_idx, sym.addr));
+                                        ui.close();
+                                    }
+
                                     //TODO: show greyed out if no trace is loaded
                                     if ui
                                         .button(
@@ -213,6 +244,15 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                     }
                 });
             });
+
+            // -------- Deferred object actions --------
+            if let Some((obj_idx, addr)) = find_callers {
+                ui_app.find_callers(obj_idx, addr);
+            }
+
+            if let Some(obj_idx) = unload {
+                ui_app.remove_object(obj_idx);
+            }
 
             // -------- Open File Prompt --------
             ui.scope_builder(egui::UiBuilder::new().max_rect(footer_rect), |ui| {
@@ -324,7 +364,7 @@ fn parse_hex_addr(filter: &str) -> Option<u64> {
 /// Truncate the middle of a string to reduce its display size while preserving start/end
 /// This is used as symbol information is usually at the start/end for very long symbols
 /// with most of the middle being namespace paths.
-fn truncate_middle(s: &str, max: usize) -> String {
+pub(super) fn truncate_middle(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_owned();
     }

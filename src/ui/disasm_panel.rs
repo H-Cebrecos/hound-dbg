@@ -1,8 +1,37 @@
+//! Disassembly panel.
+//!
+//! Renders the instructions of the selected function. Three layers of
+//! annotation sit around the instruction text, from left to right:
+//!
+//! 1. Jump arrows — for branches that stay inside the function, a lane
+//!    diagram connecting each branch to the instruction it targets.
+//! 2. The breakpoint gutter and address.
+//! 3. The inlining markers, and to their right the symbol name a direct
+//!    branch or call resolves to, when the target is a known symbol.
+//!
+//! Both diagrams are drawn the same way: the grid pass records a rect per
+//! row while laying out the text, and a second pass paints the connecting
+//! lines over those rects once every row's position is known.
+
 use egui::{Color32, Context, RichText};
+
+use crate::disasm::DisasmFunction;
+
+/// Horizontal space taken by one jump-arrow lane.
+const LANE_WIDTH: f32 = 6.0;
+
+/// Lanes beyond this share the outermost one, bounding how much horizontal
+/// space a densely branching function can claim.
+const MAX_LANES: usize = 6;
 
 pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
     let mut frame = egui::Frame::central_panel(&ctx.style());
     frame.fill = ctx.style().visuals.panel_fill.gamma_multiply(0.7);
+
+    // Navigation requested from inside the panel (clicking a resolved branch
+    // target), applied once the panel has released its borrow on the object.
+    let mut nav_request: Option<u64> = None;
+    let scroll_to = ui_app.scroll_to.take();
 
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
         if ui_app.app.objects.is_empty() {
@@ -50,8 +79,13 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
                     let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
 
+                    // Jumps that stay inside this function, laid out into
+                    // non-overlapping lanes before anything is drawn.
+                    let jumps = JumpLanes::of(&func);
+                    let mut jump_rects: Vec<egui::Rect> = Vec::new();
+
                     egui::Grid::new("disasm_grid")
-                        .num_columns(4)
+                        .num_columns(if jumps.is_empty() { 5 } else { 6 })
                         .striped(false)
                         .spacing([10.0, 4.0])
                         .show(ui, |ui| {
@@ -65,42 +99,61 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                 let mnemonic = parts.next().unwrap_or("");
                                 let operands = parts.next().unwrap_or("").trim();
 
-                                // ---------- Breakpoint gutter + address, tightly grouped ----------
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-
-                                    let bp_size = 14.0; // fixed, independent of text height
-                                    let (bp_rect, bp_response) = ui.allocate_exact_size(
-                                        egui::vec2(bp_size, row_height),
-                                        egui::Sense::click(),
+                                // ---------- Jump arrow gutter ----------
+                                if !jumps.is_empty() {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(jumps.width(), row_height),
+                                        egui::Sense::hover(),
                                     );
-                                    let has_bp = breakpoints.contains(&instr.addr);
-                                    if has_bp {
-                                        ui.painter().circle_filled(
-                                            bp_rect.center(),
-                                            4.0,
-                                            super::THEME.red,
-                                        );
-                                    } else if bp_response.hovered() {
-                                        ui.painter().circle_stroke(
-                                            bp_rect.center(),
-                                            4.0,
-                                            egui::Stroke::new(
-                                                1.0,
-                                                super::THEME.red.gamma_multiply(0.5),
-                                            ),
-                                        );
-                                    }
-                                    if bp_response.clicked() {
-                                        if has_bp {
-                                            breakpoints.remove(&instr.addr);
-                                        } else {
-                                            breakpoints.insert(instr.addr);
-                                        }
-                                    }
+                                    jump_rects.push(rect);
+                                }
 
-                                    ui.label(RichText::new(format!("{:08x}", instr.addr)).weak());
-                                });
+                                // ---------- Breakpoint gutter + address, tightly grouped ----------
+                                let addr_cell = ui
+                                    .horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+
+                                        let bp_size = 14.0; // fixed, independent of text height
+                                        let (bp_rect, bp_response) = ui.allocate_exact_size(
+                                            egui::vec2(bp_size, row_height),
+                                            egui::Sense::click(),
+                                        );
+                                        let has_bp = breakpoints.contains(&instr.addr);
+                                        if has_bp {
+                                            ui.painter().circle_filled(
+                                                bp_rect.center(),
+                                                4.0,
+                                                super::THEME.red,
+                                            );
+                                        } else if bp_response.hovered() {
+                                            ui.painter().circle_stroke(
+                                                bp_rect.center(),
+                                                4.0,
+                                                egui::Stroke::new(
+                                                    1.0,
+                                                    super::THEME.red.gamma_multiply(0.5),
+                                                ),
+                                            );
+                                        }
+                                        if bp_response.clicked() {
+                                            if has_bp {
+                                                breakpoints.remove(&instr.addr);
+                                            } else {
+                                                breakpoints.insert(instr.addr);
+                                            }
+                                        }
+
+                                        ui.label(
+                                            RichText::new(format!("{:08x}", instr.addr)).weak(),
+                                        );
+                                    })
+                                    .response;
+
+                                // Requested from another panel: bring the
+                                // instruction into view once it has a rect.
+                                if scroll_to == Some(instr.addr) {
+                                    addr_cell.scroll_to_me(Some(egui::Align::Center));
+                                }
 
                                 ui.label(RichText::new(mnemonic).color(super::THEME.blue));
                                 ui.label(operands);
@@ -151,6 +204,31 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                     }
                                 });
 
+                                // ---------- Resolved branch target ----------
+                                // Only direct transfers to an address that is
+                                // itself a known symbol get a name; anything
+                                // else (indirect, or a target inside some
+                                // function) is left blank.
+                                match instr.kind.target().and_then(|t| disasm.symbol_at(t)) {
+                                    Some(name) => {
+                                        let label = ui.selectable_label(
+                                            false,
+                                            RichText::new(format!(
+                                                "→ {}",
+                                                super::sym_panel::truncate_middle(name, 48)
+                                            ))
+                                            .color(super::THEME.green),
+                                        );
+
+                                        if label.on_hover_text(name).clicked() {
+                                            nav_request = instr.kind.target();
+                                        }
+                                    }
+                                    None => {
+                                        ui.label("");
+                                    }
+                                }
+
                                 ui.end_row();
                                 last_chain = chain;
                                 rows.push(cells);
@@ -159,6 +237,9 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                 let _ = row_idx;
                             }
                         });
+
+                    // ---------- Second pass: jump arrows ----------
+                    jumps.draw(ui.painter(), &jump_rects);
 
                     // ---------- Second pass: call-chain depth connectors (unchanged) ----------
                     let painter = ui.painter();
@@ -277,11 +358,130 @@ pub fn disasm_panel(ctx: &Context, ui_app: &mut super::Ui) {
                 );
             });
     });
+
+    // Follow a clicked branch target, in the object the panel was showing.
+    if let Some(addr) = nav_request
+        && let Some(sel) = ui_app.app.active
+    {
+        ui_app.reveal(sel.obj, addr);
+    }
 }
 
 struct DepthCell {
     rect: egui::Rect,
     is_new: bool, // true = 'dot' (run starts here), false = '|' (continues)
+}
+
+/// One branch that stays inside the displayed function, as row indices into
+/// the rendered instruction list.
+struct Jump {
+    from: usize,
+    to: usize,
+    /// Which vertical lane this jump's line is drawn in; lane 0 sits
+    /// closest to the instruction text.
+    lane: usize,
+}
+
+/// The intra-function jumps of one function, assigned to lanes so that no
+/// two overlapping jumps share a vertical line.
+struct JumpLanes {
+    jumps: Vec<Jump>,
+    lane_count: usize,
+}
+
+impl JumpLanes {
+    /// Collect the branches of `func` whose target is another instruction
+    /// of the same function, and lay them out.
+    ///
+    /// Calls are excluded: they come back, so drawing them as a jump inside
+    /// the function would be misleading — a call's destination is shown by
+    /// name instead.
+    fn of(func: &DisasmFunction<'_>) -> Self {
+        let addrs: Vec<u64> = func.instructions().map(|i| i.addr).collect();
+
+        let mut jumps: Vec<Jump> = func
+            .instructions()
+            .enumerate()
+            .filter_map(|(row, instr)| {
+                if instr.kind.is_call() {
+                    return None;
+                }
+
+                let target = instr.kind.target()?;
+                // Instruction addresses are sorted, and a target that isn't
+                // one of them is outside the function (or misaligned).
+                let to = addrs.binary_search(&target).ok()?;
+
+                (to != row).then_some(Jump {
+                    from: row,
+                    to,
+                    lane: 0,
+                })
+            })
+            .collect();
+
+        // Shortest first, so tight loops get the innermost lanes and long
+        // jumps arc around them.
+        jumps.sort_by_key(|j| j.from.abs_diff(j.to));
+
+        // Greedy lane assignment: reuse the innermost lane whose occupied
+        // spans don't overlap this jump.
+        let mut lanes: Vec<Vec<(usize, usize)>> = Vec::new();
+        for jump in &mut jumps {
+            let (lo, hi) = (jump.from.min(jump.to), jump.from.max(jump.to));
+
+            let lane = lanes
+                .iter()
+                .position(|spans| spans.iter().all(|&(a, b)| hi < a || lo > b))
+                .unwrap_or_else(|| {
+                    lanes.push(Vec::new());
+                    lanes.len() - 1
+                });
+
+            lanes[lane].push((lo, hi));
+            jump.lane = lane.min(MAX_LANES - 1);
+        }
+
+        Self {
+            jumps,
+            lane_count: lanes.len().min(MAX_LANES),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.jumps.is_empty()
+    }
+
+    /// Width the gutter needs, including the stub that joins the outermost
+    /// lane to the instruction it points at.
+    fn width(&self) -> f32 {
+        (self.lane_count + 1) as f32 * LANE_WIDTH
+    }
+
+    /// Paint the arrows over the per-row rects recorded during layout.
+    fn draw(&self, painter: &egui::Painter, row_rects: &[egui::Rect]) {
+        let stroke = egui::Stroke::new(1.0, super::THEME.overlay1.gamma_multiply(0.8));
+
+        for jump in &self.jumps {
+            let (Some(from), Some(to)) = (row_rects.get(jump.from), row_rects.get(jump.to)) else {
+                continue;
+            };
+
+            // Lane 0 is nearest the text, i.e. rightmost in the gutter.
+            let x = from.right() - (jump.lane + 1) as f32 * LANE_WIDTH;
+            let (y0, y1) = (from.center().y, to.center().y);
+
+            painter.line_segment([egui::pos2(x, y0), egui::pos2(from.right(), y0)], stroke);
+            painter.line_segment([egui::pos2(x, y0), egui::pos2(x, y1)], stroke);
+            painter.line_segment([egui::pos2(x, y1), egui::pos2(to.right(), y1)], stroke);
+
+            // Arrow head at the target, pointing into the instruction.
+            let tip = egui::pos2(to.right(), y1);
+            for dy in [-3.0, 3.0] {
+                painter.line_segment([egui::pos2(tip.x - 4.0, tip.y + dy), tip], stroke);
+            }
+        }
+    }
 }
 
 fn draw_run(

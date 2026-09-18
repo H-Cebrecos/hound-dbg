@@ -31,6 +31,27 @@ struct App {
 }
 
 impl App {
+    /// Drop a loaded object file, keeping [`App::active`] pointing at the
+    /// same function it did before — objects are addressed by position, so
+    /// every selection after `idx` shifts down by one, and a selection
+    /// *into* the removed object is cleared.
+    pub fn remove_object(&mut self, idx: ObjectIndex) {
+        if idx >= self.objects.len() {
+            return;
+        }
+
+        self.objects.remove(idx);
+
+        self.active = self.active.and_then(|sel| match sel.obj {
+            obj if obj == idx => None,
+            obj if obj > idx => Some(Selection {
+                obj: obj - 1,
+                ..sel
+            }),
+            _ => Some(sel),
+        });
+    }
+
     pub fn get_active_sym_name(&self) -> Option<&str> {
         let file_idx = self.active?.obj;
         let addr = self.active?.addr;
