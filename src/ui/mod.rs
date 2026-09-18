@@ -4,11 +4,15 @@ use std::{
 };
 
 use eframe::NativeOptions;
-use egui::{FontData, FontDefinitions, FontFamily, Key::N, RichText};
+use egui::{FontData, FontDefinitions, FontFamily, RichText};
 use fuzzy_matcher::skim::SkimMatcherV2;
 
-use crate::{App, ObjectFile, disasm::DisasmBinary, trace_file::TraceFile};
+use crate::{App, ObjectFile, ObjectIndex, Selection, disasm::DisasmBinary, trace_file::TraceFile};
 
+use callers_panel::CallerSearch;
+
+mod break_panel;
+mod callers_panel;
 mod disasm_panel;
 mod sym_panel;
 mod trace_panel;
@@ -27,6 +31,14 @@ pub struct Ui {
     symbol_filter: String,
     symbol_matcher: SkimMatcherV2,
     source_active: HashMap<u8, bool>,
+
+    /// Result of the most recent "find callers" action, if it hasn't been
+    /// dismissed yet.
+    callers: Option<CallerSearch>,
+
+    /// Address the disassembly panel should scroll into view on the next
+    /// frame, set when navigating from another panel. Cleared once used.
+    scroll_to: Option<u64>,
 }
 
 impl Ui {
@@ -44,6 +56,8 @@ impl Ui {
             symbol_filter: String::new(),
             symbol_matcher: SkimMatcherV2::default(),
             source_active: HashMap::new(),
+            callers: None,
+            scroll_to: None,
         }
     }
 
@@ -112,6 +126,46 @@ impl Ui {
         }
     }
 
+    /// Unload an object file, dropping any caller search that was run
+    /// against it (or re-pointing it if its object shifted down).
+    fn remove_object(&mut self, idx: ObjectIndex) {
+        self.app.remove_object(idx);
+
+        self.callers = self.callers.take().and_then(|search| match search.obj() {
+            obj if obj == idx => None,
+            obj if obj > idx => Some(search.rebased(obj - 1)),
+            _ => Some(search),
+        });
+    }
+
+    /// Show `addr` in the disassembly panel: select the function containing
+    /// it and queue a scroll to the instruction itself.
+    fn reveal(&mut self, obj: ObjectIndex, addr: u64) {
+        let Some(func) = self
+            .app
+            .objects
+            .get(obj)
+            .and_then(|o| o.disasm.function_containing(addr))
+        else {
+            return;
+        };
+
+        self.app.active = Some(Selection {
+            obj,
+            addr: func.addr,
+        });
+        self.scroll_to = Some(addr);
+    }
+
+    /// Run a "who calls this?" query and open the results panel.
+    fn find_callers(&mut self, obj: ObjectIndex, target: u64) {
+        let Some(object) = self.app.objects.get(obj) else {
+            return;
+        };
+
+        self.callers = Some(CallerSearch::run(obj, object, target));
+    }
+
     fn handle_fullscreen(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             self.fullscreen = !self.fullscreen;
@@ -145,7 +199,7 @@ impl Ui {
             .show_separator_line(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    // Left dot — toggles symbol panel
+                    // Left dot — toggles breakpoint panel
                     if ui.button(RichText::new("●").size(24.)).clicked() {
                         self.break_panel_open = !self.break_panel_open;
                     }
@@ -191,27 +245,10 @@ impl eframe::App for Ui {
         self.handle_drag_and_drop(ctx);
         self.show_top_bar(ctx);
 
-        egui::SidePanel::left("breakpoints")
-            .show_separator_line(true)
-            .resizable(true)
-            .default_width(400.0)
-            .show_animated(ctx, self.break_panel_open, |ui| {
-                ui.label("Breakpoints");
-                for obj in &mut self.app.objects {
-                    ui.label(&obj.name);
-                    for bp in &obj.breakpoints {
-                        let matches: Vec<_> =
-                            obj.disasm.functions().filter(|f| f.contains(*bp)).collect();
-
-                        if !matches.is_empty() {
-                            ui.label(matches[0].name);
-                        }
-                    }
-                }
-            });
-
+        break_panel::break_panel(ctx, self);
         sym_panel::sym_panel(ctx, self);
         trace_panel::trace_panel(ctx, self);
         disasm_panel::disasm_panel(ctx, self);
+        callers_panel::callers_panel(ctx, self);
     }
 }
