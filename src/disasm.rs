@@ -61,6 +61,30 @@ pub struct DisasmInstr {
     pub bytes: Vec<u8>,
 }
 
+impl InstrKind {
+    /// Statically known destination of a direct control-flow instruction.
+    ///
+    /// `None` for instructions that don't branch, or whose destination only
+    /// becomes known at runtime.
+    pub fn target(&self) -> Option<u64> {
+        match *self {
+            InstrKind::CondBranch(addr)
+            | InstrKind::DirectJump(addr)
+            | InstrKind::DirectCall(addr) => Some(addr),
+            InstrKind::IndirectJump
+            | InstrKind::IndirectCall
+            | InstrKind::Return
+            | InstrKind::Other => None,
+        }
+    }
+
+    /// Whether this instruction establishes a new call frame, regardless of
+    /// whether its target is statically known.
+    pub fn is_call(&self) -> bool {
+        matches!(self, InstrKind::DirectCall(_) | InstrKind::IndirectCall)
+    }
+}
+
 impl DisasmInstr {
     pub fn is_control_flow(&self) -> bool {
         match &self.kind {
@@ -68,6 +92,23 @@ impl DisasmInstr {
             _ => true,
         }
     }
+}
+
+/// One instruction that transfers control to a given function.
+///
+/// Produced by [`DisasmBinary::callers_of`]; addresses index back into the
+/// same binary the query was made against.
+#[derive(Debug, Clone, Copy)]
+pub struct CallSite {
+    /// Entry address of the function the call was found in.
+    pub caller_addr: u64,
+
+    /// Address of the calling instruction itself.
+    pub site_addr: u64,
+
+    /// True when control is transferred by a plain branch to the target's
+    /// entry point (a tail call) rather than by a linking call instruction.
+    pub tail: bool,
 }
 
 /// One raw symbol observed at a given address, before canonical-name
@@ -363,36 +404,83 @@ impl DisasmBinary {
             .functions
             .iter()
             .find(|e| e.names.iter().any(|n| n == name))?;
-        Some(DisasmFunction {
-            name: &entry.names[0],
-            aliases: &entry.names,
-            addr: entry.addr,
-            size: self.function_size(&entry.range),
-            instructions: &self.index[entry.range.clone()],
-        })
+        Some(self.function_from_entry(entry))
     }
 
     /// Look up a function by its entry point address.
     pub fn function_at_addr(&self, addr: u64) -> Option<DisasmFunction<'_>> {
-        let entry = self.functions.iter().find(|e| e.addr == addr)?;
-        Some(DisasmFunction {
-            name: &entry.names[0],
-            aliases: &entry.names,
-            addr: entry.addr,
-            size: self.function_size(&entry.range),
-            instructions: &self.index[entry.range.clone()],
-        })
+        // `functions` is built from a sorted address list, so entry lookup
+        // is a binary search rather than a scan.
+        let idx = self
+            .functions
+            .binary_search_by_key(&addr, |e| e.addr)
+            .ok()?;
+        Some(self.function_from_entry(&self.functions[idx]))
+    }
+
+    /// Look up the function whose body covers `addr`, which need not be its
+    /// entry point.
+    pub fn function_containing(&self, addr: u64) -> Option<DisasmFunction<'_>> {
+        let idx = self.functions.partition_point(|e| e.addr <= addr);
+        let entry = self.functions.get(idx.checked_sub(1)?)?;
+        let func = self.function_from_entry(entry);
+        func.contains(addr).then_some(func)
+    }
+
+    /// Canonical symbol name of the function that starts exactly at `addr`.
+    ///
+    /// Deliberately entry-point-only: it answers "is this address a known
+    /// symbol?", which is what branch-target resolution needs.
+    pub fn symbol_at(&self, addr: u64) -> Option<&str> {
+        self.function_at_addr(addr).map(|f| f.name)
     }
 
     /// Iterate over all decoded functions (one entry per unique address).
     pub fn functions(&self) -> impl Iterator<Item = DisasmFunction<'_>> {
-        self.functions.iter().map(|entry| DisasmFunction {
+        self.functions
+            .iter()
+            .map(|entry| self.function_from_entry(entry))
+    }
+
+    /// Every instruction in this binary that transfers control to the
+    /// function entry at `target`.
+    ///
+    /// Both linking calls and tail calls (a plain branch from *another*
+    /// function into `target`'s entry point) count as call sites; a branch
+    /// back to the target's own entry is a loop, not a call, and is skipped.
+    pub fn callers_of(&self, target: u64) -> Vec<CallSite> {
+        let mut sites = Vec::new();
+
+        for entry in &self.functions {
+            for instr in &self.index[entry.range.clone()] {
+                if instr.kind.target() != Some(target) {
+                    continue;
+                }
+
+                let tail = !instr.kind.is_call();
+                if tail && entry.addr == target {
+                    continue;
+                }
+
+                sites.push(CallSite {
+                    caller_addr: entry.addr,
+                    site_addr: instr.addr,
+                    tail,
+                });
+            }
+        }
+
+        sites
+    }
+
+    fn function_from_entry<'a>(&'a self, entry: &'a FunctionEntry) -> DisasmFunction<'a> {
+        DisasmFunction {
             name: &entry.names[0],
             aliases: &entry.names,
             addr: entry.addr,
             size: self.function_size(&entry.range),
             instructions: &self.index[entry.range.clone()],
-        })
+        }
     }
     /// Return the instruction at exactly the given address, if any.
     pub fn instruction_at(&self, addr: u64) -> Option<&DisasmInstr> {
@@ -572,41 +660,51 @@ impl CapstoneBackend {
                 let mut has_ret = false;
                 let mut has_branch = false;
                 let mut has_jump = false;
+                let mut has_call = false;
 
                 for g in groups {
                     match g.0 as u32 {
                         RISCV_GRP_RET | RISCV_GRP_IRET => has_ret = true,
                         RISCV_GRP_BRANCH_RELATIVE => has_branch = true,
-                        RISCV_GRP_JUMP | RISCV_GRP_CALL => has_jump = true,
+                        RISCV_GRP_CALL => has_call = true,
+                        RISCV_GRP_JUMP => has_jump = true,
                         _ => {}
                     }
                 }
 
-                if has_ret {
+                // capstone puts every `jal`/`jalr` in the call group,
+                // including the `j`/`jr`/`ret` aliases that discard the
+                // return address. The printed mnemonic is what separates
+                // them: only the linking forms keep their `jal`/`jalr` name.
+                let mnemonic = insn.mnemonic().unwrap_or_default();
+                let links = matches!(mnemonic, "jal" | "jalr" | "c.jal" | "c.jalr");
+
+                if has_ret || mnemonic == "ret" {
                     return Ok(InstrKind::Return);
                 }
 
-                if has_branch || has_jump {
+                if has_branch || has_jump || has_call {
                     let imm = detail
                         .arch_detail()
                         .operands()
                         .iter()
-                        .find_map(|op| match op {
+                        // The branch target is always the last immediate:
+                        // `tbz` and friends carry a bit index first.
+                        .filter_map(|op| match op {
                             arch::ArchOperand::RiscVOperand(arch::riscv::RiscVOperand::Imm(
                                 imm,
                             )) => Some(*imm),
                             _ => None,
-                        });
+                        })
+                        .next_back();
 
-                    Ok(match (has_branch, imm) {
-                        (true, Some(imm)) => {
-                            InstrKind::CondBranch(insn.address().wrapping_add(imm as u64))
-                        }
-                        (false, Some(imm)) => {
-                            InstrKind::DirectJump(insn.address().wrapping_add(imm as u64))
-                        }
-                        (_, None) => InstrKind::IndirectJump,
-                    })
+                    Ok(branch_kind(
+                        has_call && links,
+                        has_branch,
+                        // RISC-V branch immediates arrive as an offset from
+                        // the instruction, unlike AArch64 below.
+                        imm.map(|imm| insn.address().wrapping_add(imm as u64)),
+                    ))
                 } else {
                     Ok(InstrKind::Other)
                 }
@@ -622,12 +720,14 @@ impl CapstoneBackend {
                 let mut has_ret = false;
                 let mut has_branch = false;
                 let mut has_jump = false;
+                let mut has_call = false;
 
                 for g in groups {
                     match g.0 as u32 {
                         ARM64_GRP_RET => has_ret = true,
                         ARM64_GRP_BRANCH_RELATIVE => has_branch = true,
-                        ARM64_GRP_JUMP | ARM64_GRP_CALL => has_jump = true,
+                        ARM64_GRP_CALL => has_call = true,
+                        ARM64_GRP_JUMP => has_jump = true,
                         _ => {}
                     }
                 }
@@ -635,28 +735,29 @@ impl CapstoneBackend {
                     return Ok(InstrKind::Return);
                 }
 
-                if has_branch || has_jump {
+                if has_branch || has_jump || has_call {
                     let imm = detail
                         .arch_detail()
                         .operands()
                         .iter()
-                        .find_map(|op| match op {
+                        // The branch target is always the last immediate:
+                        // `tbz` and friends carry a bit index first.
+                        .filter_map(|op| match op {
                             arch::ArchOperand::Arm64Operand(op) => match op.op_type {
                                 arch::arm64::Arm64OperandType::Imm(imm) => Some(imm),
                                 _ => None,
                             },
                             _ => None,
-                        });
+                        })
+                        .next_back();
 
-                    Ok(match (has_branch, imm) {
-                        (true, Some(imm)) => {
-                            InstrKind::CondBranch(insn.address().wrapping_add(imm as u64))
-                        }
-                        (false, Some(imm)) => {
-                            InstrKind::DirectJump(insn.address().wrapping_add(imm as u64))
-                        }
-                        (_, None) => InstrKind::IndirectJump,
-                    })
+                    Ok(branch_kind(
+                        has_call,
+                        has_branch,
+                        // capstone has already resolved AArch64 branch
+                        // immediates against the instruction address.
+                        imm.map(|imm| imm as u64),
+                    ))
                 } else {
                     Ok(InstrKind::Other)
                 }
@@ -714,6 +815,22 @@ pub enum DisasmError {
 //  Helpers
 // ============================================================================
 
+/// Classify a branch-like instruction from the groups capstone reported for
+/// it, plus its resolved target (if the target was a statically known
+/// immediate).
+///
+/// Calls are checked first: a linking branch (`bl`, `jal ra, …`) carries the
+/// relative-branch group too, and being a call is the more specific fact.
+fn branch_kind(is_call: bool, is_relative_branch: bool, target: Option<u64>) -> InstrKind {
+    match (is_call, is_relative_branch, target) {
+        (true, _, Some(target)) => InstrKind::DirectCall(target),
+        (true, _, None) => InstrKind::IndirectCall,
+        (false, true, Some(target)) => InstrKind::CondBranch(target),
+        (false, false, Some(target)) => InstrKind::DirectJump(target),
+        (false, _, None) => InstrKind::IndirectJump,
+    }
+}
+
 fn demangle(name: &str) -> String {
     if let Ok(sym) = rustc_demangle::try_demangle(name) {
         return sym.to_string();
@@ -737,4 +854,226 @@ fn is_noise_symbol(name: &str) -> bool {
         || name.starts_with("$t")
         || name == "$a"
         || name.is_empty()
+}
+
+// ============================================================================
+//  Tests
+// ============================================================================
+
+#[cfg(test)]
+impl DisasmBinary {
+    /// Assemble a binary straight from decoded instructions and symbol
+    /// bounds, skipping object-file parsing. Test-only: `load` remains the
+    /// single production entry point.
+    fn from_parts(index: Vec<DisasmInstr>, symbols: &[(u64, u64, &str)]) -> Self {
+        let functions = symbols
+            .iter()
+            .map(|&(addr, end_addr, name)| {
+                let idx_of = |a: u64| {
+                    index
+                        .binary_search_by_key(&a, |i: &DisasmInstr| i.addr)
+                        .unwrap_or_else(|insert_pos| insert_pos)
+                };
+
+                FunctionEntry {
+                    addr,
+                    range: idx_of(addr)..idx_of(end_addr),
+                    names: vec![name.to_owned()],
+                }
+            })
+            .collect();
+
+        Self {
+            index,
+            functions,
+            debug_info: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode a single instruction at `addr` with the backend for `arch`.
+    fn decode_one(arch: Architecture, bytes: &[u8], addr: u64) -> DisasmInstr {
+        let mut decoded = CapstoneBackend::new(arch)
+            .decode(bytes, addr)
+            .expect("decode failed");
+        assert_eq!(decoded.len(), 1, "expected exactly one instruction");
+        decoded.pop().unwrap()
+    }
+
+    /// Every branch-target feature (target names, caller lookup, jump
+    /// arrows) rests on `InstrKind`'s addresses being absolute, but capstone
+    /// doesn't report branch immediates the same way on both backends: it
+    /// resolves them against the instruction address on AArch64 and leaves
+    /// them relative on RISC-V. Pin that down — a regression here would show
+    /// up as targets that silently resolve to no symbol at all.
+    #[test]
+    fn resolves_branch_immediates_of_both_backends() {
+        // bl #+0x10 at 0x1000 — capstone reports 0x1010.
+        let aarch64 = decode_one(Architecture::Aarch64, &[0x04, 0x00, 0x00, 0x94], 0x1000);
+        assert_eq!(aarch64.kind.target(), Some(0x1010), "{}", aarch64.text);
+
+        // jal ra, 0x10 at 0x1000 — capstone reports 0x10.
+        let riscv = decode_one(Architecture::Riscv64, &[0xef, 0x00, 0x00, 0x01], 0x1000);
+        assert_eq!(riscv.kind.target(), Some(0x1010), "{}", riscv.text);
+    }
+    #[test]
+    fn classifies_aarch64_control_flow() {
+        let at = |bytes: &[u8]| decode_one(Architecture::Aarch64, bytes, 0x1000).kind;
+
+        // bl #+0x10 — a call, even though it is also a relative branch.
+        assert!(matches!(
+            at(&[0x04, 0x00, 0x00, 0x94]),
+            InstrKind::DirectCall(0x1010)
+        ));
+
+        // blr x0 — a call whose target is only known at runtime.
+        assert!(matches!(
+            at(&[0x00, 0x00, 0x3f, 0xd6]),
+            InstrKind::IndirectCall
+        ));
+
+        // Branches keep their statically known target, and none of them is
+        // mistaken for a call.
+        for bytes in [
+            [0x02, 0x00, 0x00, 0x14], // b    #+0x8
+            [0x40, 0x00, 0x00, 0x54], // b.eq #+0x8
+            [0x40, 0x00, 0x00, 0xb4], // cbz  x0, #+0x8
+            [0x40, 0x00, 0x00, 0x36], // tbz  w0, #0, #+0x8
+        ] {
+            let kind = at(&bytes);
+            // `tbz` carries a bit index before its target, so this also
+            // pins down which immediate the target is read from.
+            assert_eq!(kind.target(), Some(0x1008), "{kind:?}");
+            assert!(!kind.is_call(), "{kind:?}");
+        }
+
+        // br x1 — an unresolvable branch.
+        assert!(matches!(
+            at(&[0x20, 0x00, 0x1f, 0xd6]),
+            InstrKind::IndirectJump
+        ));
+
+        assert!(matches!(at(&[0xc0, 0x03, 0x5f, 0xd6]), InstrKind::Return));
+
+        // nop — no control flow at all.
+        let nop = decode_one(Architecture::Aarch64, &[0x1f, 0x20, 0x03, 0xd5], 0x1000);
+        assert!(!nop.is_control_flow());
+        assert_eq!(nop.kind.target(), None);
+    }
+
+    /// On RISC-V every `jal`/`jalr` lands in capstone's call group, aliases
+    /// included, so `j`, `jr` and `ret` have to be told apart from real
+    /// calls by mnemonic.
+    #[test]
+    fn classifies_riscv_control_flow() {
+        let at = |bytes: &[u8]| decode_one(Architecture::Riscv64, bytes, 0x1000).kind;
+
+        // jal ra, 0x10 — links, so it is a call.
+        assert!(matches!(
+            at(&[0xef, 0x00, 0x00, 0x01]),
+            InstrKind::DirectCall(0x1010)
+        ));
+
+        // j 0x10 (jal zero, 0x10) — same encoding family, but no link.
+        assert!(matches!(
+            at(&[0x6f, 0x00, 0x00, 0x01]),
+            InstrKind::DirectJump(0x1010)
+        ));
+
+        // beqz zero, 0x10
+        assert!(matches!(
+            at(&[0x63, 0x08, 0x00, 0x00]),
+            InstrKind::CondBranch(0x1010)
+        ));
+
+        // jr zero — an indirect jump, not an indirect call.
+        assert!(matches!(
+            at(&[0x67, 0x00, 0x00, 0x00]),
+            InstrKind::IndirectJump
+        ));
+
+        // ret (jalr zero, 0(ra))
+        assert!(matches!(at(&[0x67, 0x80, 0x00, 0x00]), InstrKind::Return));
+    }
+
+    /// Synthetic three-function binary, laid out back to back the way a
+    /// real text section is:
+    ///
+    /// ```text
+    /// 0x1000 caller: call 0x1010 ; call 0x1010 ; branch 0x1000 ; ret
+    /// 0x1010 callee: branch 0x1010 ; ret
+    /// 0x1018 tail:   jump 0x1010
+    /// ```
+    fn fixture() -> DisasmBinary {
+        let instr = |addr: u64, kind: InstrKind| DisasmInstr {
+            addr,
+            kind,
+            text: String::new(),
+            bytes: vec![0; 4],
+        };
+
+        let index = vec![
+            instr(0x1000, InstrKind::DirectCall(0x1010)),
+            instr(0x1004, InstrKind::DirectCall(0x1010)),
+            instr(0x1008, InstrKind::CondBranch(0x1000)),
+            instr(0x100c, InstrKind::Return),
+            instr(0x1010, InstrKind::CondBranch(0x1010)),
+            instr(0x1014, InstrKind::Return),
+            instr(0x1018, InstrKind::DirectJump(0x1010)),
+        ];
+
+        DisasmBinary::from_parts(
+            index,
+            &[
+                (0x1000, 0x1010, "caller"),
+                (0x1010, 0x1018, "callee"),
+                (0x1018, 0x101c, "tail"),
+            ],
+        )
+    }
+
+    #[test]
+    fn resolves_symbols_by_address() {
+        let bin = fixture();
+
+        assert_eq!(bin.symbol_at(0x1010), Some("callee"));
+        // Entry points only — an address inside a function is not a symbol.
+        assert_eq!(bin.symbol_at(0x1014), None);
+        assert_eq!(bin.symbol_at(0x2000), None);
+
+        assert_eq!(
+            bin.function_containing(0x1014).map(|f| f.name),
+            Some("callee")
+        );
+        assert_eq!(bin.function_containing(0x2000).map(|f| f.name), None);
+    }
+
+    #[test]
+    fn finds_callers_including_tail_calls() {
+        let bin = fixture();
+
+        let named: Vec<_> = bin
+            .callers_of(0x1010)
+            .iter()
+            .map(|s| (bin.symbol_at(s.caller_addr).unwrap(), s.site_addr, s.tail))
+            .collect();
+
+        assert_eq!(
+            named,
+            vec![
+                ("caller", 0x1000, false),
+                ("caller", 0x1004, false),
+                // A branch from another function into the entry point is a
+                // tail call; `callee`'s own branch back to 0x1010 is a loop.
+                ("tail", 0x1018, true),
+            ]
+        );
+
+        // `caller`'s branch back to its own entry is not a call either.
+        assert!(bin.callers_of(0x1000).is_empty());
+    }
 }
