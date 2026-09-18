@@ -6,8 +6,9 @@ use std::{
 use eframe::NativeOptions;
 use egui::{FontData, FontDefinitions, FontFamily, RichText};
 use fuzzy_matcher::skim::SkimMatcherV2;
+use slotmap::SlotMap;
 
-use crate::{App, ObjectFile, ObjectIndex, Selection, disasm::DisasmBinary, trace_file::TraceFile};
+use crate::{App, Location, ObjectFile, ObjectKey, disasm::DisasmBinary, trace_file::TraceFile};
 
 use callers_panel::CallerSearch;
 
@@ -45,7 +46,7 @@ impl Ui {
     pub fn new() -> Self {
         Ui {
             app: App {
-                objects: Vec::new(),
+                objects: SlotMap::with_key(),
                 active: None,
                 trace: None,
             },
@@ -114,7 +115,7 @@ impl Ui {
             match DisasmBinary::load(path) {
                 Ok(disasm) => {
                     let name = path.file_stem().unwrap().to_string_lossy().into_owned();
-                    self.app.objects.push(ObjectFile {
+                    self.app.objects.insert(ObjectFile {
                         name,
                         disasm,
                         breakpoints: HashSet::new(),
@@ -128,19 +129,17 @@ impl Ui {
 
     /// Unload an object file, dropping any caller search that was run
     /// against it (or re-pointing it if its object shifted down).
-    fn remove_object(&mut self, idx: ObjectIndex) {
-        self.app.remove_object(idx);
-
-        self.callers = self.callers.take().and_then(|search| match search.obj() {
-            obj if obj == idx => None,
-            obj if obj > idx => Some(search.rebased(obj - 1)),
+    fn remove_object(&mut self, key: ObjectKey) {
+        self.app.remove_object(key);
+        self.callers = self.callers.take().and_then(|search| match search.obj {
+            obj if obj == key => None,
             _ => Some(search),
         });
     }
 
     /// Show `addr` in the disassembly panel: select the function containing
     /// it and queue a scroll to the instruction itself.
-    fn reveal(&mut self, obj: ObjectIndex, addr: u64) {
+    fn reveal(&mut self, obj: ObjectKey, addr: u64) {
         let Some(func) = self
             .app
             .objects
@@ -150,7 +149,7 @@ impl Ui {
             return;
         };
 
-        self.app.active = Some(Selection {
+        self.app.active = Some(Location {
             obj,
             addr: func.addr,
         });
@@ -158,7 +157,7 @@ impl Ui {
     }
 
     /// Run a "who calls this?" query and open the results panel.
-    fn find_callers(&mut self, obj: ObjectIndex, target: u64) {
+    fn find_callers(&mut self, obj: ObjectKey, target: u64) {
         let Some(object) = self.app.objects.get(obj) else {
             return;
         };

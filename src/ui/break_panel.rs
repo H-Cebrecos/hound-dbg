@@ -12,7 +12,7 @@
 
 use egui::{Context, RichText};
 
-use crate::{ObjectIndex, Selection};
+use crate::{Location, ObjectKey};
 
 /// Render the breakpoint panel.
 pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
@@ -22,11 +22,16 @@ pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
         .default_width(320.0)
         .show_animated(ctx, ui_app.break_panel_open, |ui| {
             // Applied after the walk below, which borrows the objects.
-            let mut remove: Option<(ObjectIndex, u64)> = None;
-            let mut reveal: Option<(ObjectIndex, u64)> = None;
+            let mut remove: Option<(ObjectKey, u64)> = None;
+            let mut reveal: Option<(ObjectKey, u64)> = None;
             let mut clear_all = false;
 
-            let total: usize = ui_app.app.objects.iter().map(|o| o.breakpoints.len()).sum();
+            let total: usize = ui_app
+                .app
+                .objects
+                .iter()
+                .map(|o| o.1.breakpoints.len())
+                .sum();
 
             // ---------- Header ----------
             ui.horizontal(|ui| {
@@ -71,7 +76,7 @@ pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
             egui::ScrollArea::vertical()
                 .id_salt("break_scroll")
                 .show(ui, |ui| {
-                    for (obj_idx, obj) in ui_app.app.objects.iter().enumerate() {
+                    for (key, obj) in ui_app.app.objects.iter() {
                         if obj.breakpoints.is_empty() {
                             continue;
                         }
@@ -94,8 +99,8 @@ pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
                             for addr in addrs {
                                 let func = obj.disasm.function_containing(addr);
                                 let selected = ui_app.app.active
-                                    == func.map(|f| Selection {
-                                        obj: obj_idx,
+                                    == func.map(|f| Location {
+                                        obj: key,
                                         addr: f.addr,
                                     });
 
@@ -117,7 +122,7 @@ pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                         ui.painter().circle_filled(dot_rect.center(), 4.0, color);
 
                                         if dot.on_hover_text("Remove breakpoint").clicked() {
-                                            remove = Some((obj_idx, addr));
+                                            remove = Some((key, addr));
                                         }
 
                                         let mut location = RichText::new(match func {
@@ -142,7 +147,7 @@ pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                     .inner;
 
                                 if row.clicked() {
-                                    reveal = Some((obj_idx, addr));
+                                    reveal = Some((key, addr));
                                 }
 
                                 row.context_menu(|ui| {
@@ -163,7 +168,7 @@ pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                     }
 
                                     if ui.button("Remove breakpoint").clicked() {
-                                        remove = Some((obj_idx, addr));
+                                        remove = Some((key, addr));
                                         ui.close();
                                     }
                                 });
@@ -175,7 +180,7 @@ pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
             // ---------- Deferred mutations ----------
             if clear_all {
                 for obj in &mut ui_app.app.objects {
-                    obj.breakpoints.clear();
+                    obj.1.breakpoints.clear();
                 }
             }
 

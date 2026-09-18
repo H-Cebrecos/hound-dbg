@@ -13,7 +13,7 @@
 use egui::{Context, RichText};
 
 use crate::{
-    ObjectFile, ObjectIndex, Selection,
+    Location, ObjectFile, ObjectKey,
     disasm::{CallSite, DisasmBinary},
 };
 
@@ -21,7 +21,7 @@ use crate::{
 /// without borrowing back into the object it was run against.
 pub struct CallerSearch {
     /// Object the query was run against.
-    obj: ObjectIndex,
+    pub obj: ObjectKey,
 
     /// Entry address of the function whose callers these are.
     target_addr: u64,
@@ -42,7 +42,7 @@ struct Caller {
 impl CallerSearch {
     /// Scan `object` for calls to the function entry at `target` and group
     /// the results by calling function.
-    pub fn run(obj: ObjectIndex, object: &ObjectFile, target: u64) -> Self {
+    pub fn run(obj: ObjectKey, object: &ObjectFile, target: u64) -> Self {
         let disasm = &object.disasm;
 
         let target_name = disasm
@@ -70,16 +70,6 @@ impl CallerSearch {
             target_name,
             callers,
         }
-    }
-
-    pub fn obj(&self) -> ObjectIndex {
-        self.obj
-    }
-
-    /// Re-point this search at `obj`, for when the object it was run
-    /// against shifts position (another object was unloaded before it).
-    pub fn rebased(self, obj: ObjectIndex) -> Self {
-        Self { obj, ..self }
     }
 
     fn site_count(&self) -> usize {
@@ -152,7 +142,7 @@ pub fn callers_panel(ctx: &Context, ui_app: &mut super::Ui) {
                 .show(ui, |ui| {
                     for caller in &search.callers {
                         let selected = active
-                            == Some(Selection {
+                            == Some(Location {
                                 obj: search.obj,
                                 addr: caller.addr,
                             });

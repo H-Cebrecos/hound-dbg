@@ -40,7 +40,7 @@
 use egui::{Color32, Context, RichText};
 use fuzzy_matcher::{skim::SkimMatcherV2, *};
 
-use crate::{ObjectIndex, Selection, disasm::DisasmFunction};
+use crate::{Location, ObjectKey, disasm::DisasmFunction};
 
 /// Render the symbol panel
 pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
@@ -67,15 +67,15 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
             // Applied once the walk below has released its borrow on the
             // object list.
-            let mut unload: Option<ObjectIndex> = None;
-            let mut find_callers: Option<(ObjectIndex, u64)> = None;
+            let mut unload: Option<ObjectKey> = None;
+            let mut find_callers: Option<(ObjectKey, u64)> = None;
 
             // -------- Main View --------
             ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let filter = ui_app.symbol_filter.trim();
 
-                    for (obj_idx, obj) in &mut ui_app.app.objects.iter().enumerate() {
+                    for (key, obj) in &mut ui_app.app.objects.iter() {
                         let filtered_syms =
                             filter_symbols(obj.disasm.functions(), filter, &ui_app.symbol_matcher);
 
@@ -86,8 +86,8 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
                         let mut obj_name = RichText::new(&obj.name).heading();
                         // highlight if selected
-                        if let Some(Selection { obj, .. }) = ui_app.app.active
-                            && obj == obj_idx
+                        if let Some(Location { obj, .. }) = ui_app.app.active
+                            && obj == key
                         {
                             obj_name = obj_name.strong().color(super::THEME.mauve);
                         }
@@ -114,7 +114,7 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                         .on_hover_text(format!("Unload {}", obj.name))
                                         .clicked()
                                     {
-                                        unload = Some(obj_idx);
+                                        unload = Some(key);
                                     }
 
                                     ui.add_space(10.);
@@ -149,8 +149,8 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
                                 // Highlight if selected
                                 if ui_app.app.active
-                                    == Some(Selection {
-                                        obj: obj_idx,
+                                    == Some(Location {
+                                        obj: key,
                                         addr: sym.addr,
                                     })
                                 {
@@ -215,7 +215,7 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                     ui.separator();
 
                                     if ui.button("Find callers").clicked() {
-                                        find_callers = Some((obj_idx, sym.addr));
+                                        find_callers = Some((key, sym.addr));
                                         ui.close();
                                     }
 
@@ -234,8 +234,8 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
                                 // If clicked select as active
                                 if clickable_sym.clicked() {
-                                    ui_app.app.active = Some(Selection {
-                                        obj: obj_idx,
+                                    ui_app.app.active = Some(Location {
+                                        obj: key,
                                         addr: sym.addr,
                                     });
                                 }
