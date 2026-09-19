@@ -20,3 +20,5 @@ strsim = "0.11.1"
 memmap2 = "0.9.11"
 fs4 = "1.1.0"
 slotmap = "1.1.1"
+serde = { version="1.0.229", features = ["derive"]}
+serde_yaml = "0.9.34"

@@ -24,7 +24,7 @@ use memmap2::Mmap;
 /// replay required.
 pub struct TraceFile {
     /// Path this trace was loaded from, kept for display/error messages.
-    path: PathBuf,
+    pub path: PathBuf,
 
     /// Backing memory-mapped file. Never mutated after load.
     mmap: Mmap,

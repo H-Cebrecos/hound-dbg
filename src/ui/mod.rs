@@ -114,8 +114,12 @@ impl Ui {
         } else {
             match DisasmBinary::load(path) {
                 Ok(disasm) => {
-                    let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+                    let name = path
+                        .file_stem()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
                     self.app.objects.insert(ObjectFile {
+                        path: path.into(),
                         name,
                         disasm,
                         breakpoints: HashSet::new(),
@@ -206,6 +210,33 @@ impl Ui {
                     // Left hamburger — toggles symbol panel
                     if ui.button(RichText::new("☰").size(24.)).clicked() {
                         self.symbol_panel_open = !self.symbol_panel_open;
+                    }
+
+                    // Save project
+                    if ui.button(RichText::new("💾").size(24.)).clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Project", &["yaml", "yml"])
+                            .set_file_name("project.yaml")
+                            .save_file()
+                        {
+                            if let Err(e) = self.app.save_to_file(&path) {
+                                // TODO: surface this in the UI instead of stderr
+                                eprintln!("failed to save project: {e:?}");
+                            }
+                        }
+                    }
+
+                    // Load project
+                    if ui.button(RichText::new("📂").size(24.)).clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Project", &["yaml", "yml"])
+                            .pick_file()
+                        {
+                            match App::load_from_file(&path) {
+                                Ok(app) => self.app = app,
+                                Err(e) => eprintln!("failed to load project: {e:?}"),
+                            }
+                        }
                     }
 
                     if let Some(file) = self.app.get_active_obj_name()
