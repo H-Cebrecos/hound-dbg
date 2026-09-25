@@ -1,4 +1,5 @@
 mod disasm;
+mod misc;
 mod trace_file;
 mod ui;
 
@@ -62,9 +63,6 @@ struct Location {
 }
 
 impl App {
-    /// Drop a loaded object file
-    ///
-    /// objects are addressed by position, so locations may need to be updated, see [`Location`]
     pub fn remove_object(&mut self, key: ObjectKey) {
         if !self.objects.contains_key(key) {
             return;
@@ -93,7 +91,7 @@ impl App {
         Ok(())
     }
 
-    /// Load a project from `path`.
+    /// Load a project from YAML file.
     pub fn load_from_file(path: &Path) -> anyhow::Result<Self> {
         let yaml = std::fs::read_to_string(path)?;
         let project: ProjectFile = serde_yaml::from_str(&yaml)?;
@@ -115,8 +113,7 @@ impl App {
         }
     }
 
-    /// Rebuild an `App` from a saved project: every object and the trace
-    /// file are reopened from their stored paths.
+    /// Rebuild an `App` from a saved project
     fn from_project(project: ProjectFile) -> anyhow::Result<Self> {
         let mut objects = SlotMap::default();
 

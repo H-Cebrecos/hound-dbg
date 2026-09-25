@@ -56,6 +56,14 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                     .desired_width(f32::INFINITY),
             );
 
+            if ui
+                .add_enabled(ui_app.app.active.is_some(), egui::Button::new("🎯"))
+                .on_hover_text("Scroll to selected symbol")
+                .clicked()
+            {
+                ui_app.scroll_to_active = true;
+            };
+
             // -------- Rect computations --------
             let footer_height = 32.0;
 
@@ -75,6 +83,13 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     let filter = ui_app.symbol_filter.trim();
 
+                    // Captured once: the loop mutably borrows ui_app, so we can't
+                    // re-check/clear this mid-walk. `did_scroll` tracks whether this
+                    // frame actually performed the scroll, so we know to clear the
+                    // request afterwards.
+                    let want_scroll = ui_app.scroll_to_active;
+                    let mut did_scroll = false;
+
                     for (key, obj) in &mut ui_app.app.objects.iter() {
                         let filtered_syms =
                             filter_symbols(obj.disasm.functions(), filter, &ui_app.symbol_matcher);
@@ -86,161 +101,182 @@ pub fn sym_panel(ctx: &Context, ui_app: &mut super::Ui) {
 
                         let mut obj_name = RichText::new(&obj.name).heading();
                         // highlight if selected
-                        if let Some(Location { obj, .. }) = ui_app.app.active
-                            && obj == key
-                        {
+                        let is_active_obj =
+                            matches!(ui_app.app.active, Some(Location { obj, .. }) if obj == key);
+                        if is_active_obj {
                             obj_name = obj_name.strong().color(super::THEME.mauve);
                         }
 
                         // Per object collapsable
                         let id = ui.make_persistent_id(&obj.name);
-                        egui::collapsing_header::CollapsingState::load_with_default_open(
-                            ui.ctx(),
-                            id,
-                            true,
-                        )
-                        // header styling
-                        .show_header(ui, |ui| {
-                            ui.label(obj_name.clone());
-                            // unload button, then function count
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add(
-                                            egui::Button::new(RichText::new("✕").weak())
-                                                .frame(false),
-                                        )
-                                        .on_hover_text(format!("Unload {}", obj.name))
-                                        .clicked()
-                                    {
-                                        unload = Some(key);
-                                    }
-
-                                    ui.add_space(10.);
-
-                                    let count_text =
-                                        format!("{} functions", obj.disasm.functions().count());
-
-                                    // Measure how wide the count label would be, without drawing it,
-                                    // so we can decide whether it fits before committing to show it.
-                                    let font_id = egui::TextStyle::Body.resolve(ui.style());
-                                    let galley = ui.painter().layout_no_wrap(
-                                        count_text.clone(),
-                                        font_id,
-                                        ui.visuals().text_color(),
-                                    );
-
-                                    // Avoid function count overlapping the object name.
-                                    if ui.available_width() > galley.size().x {
-                                        ui.label(RichText::new(count_text).weak());
-                                    }
-                                },
+                        let mut collapsing =
+                            egui::collapsing_header::CollapsingState::load_with_default_open(
+                                ui.ctx(),
+                                id,
+                                true,
                             );
-                        })
-                        // Symbols
-                        .body(|ui| {
-                            for sym in filtered_syms {
-                                let mut text = RichText::new(truncate_middle(
-                                    sym.name,
-                                    (ui.available_width() / 8.) as usize,
-                                ))
-                                .weak();
 
-                                // Highlight if selected
-                                if ui_app.app.active
-                                    == Some(Location {
-                                        obj: key,
-                                        addr: sym.addr,
-                                    })
-                                {
-                                    text = text.strong().color(super::THEME.mauve);
-                                }
+                        // If we're focusing and the active symbol lives in this
+                        // (possibly collapsed) object, force it open so the row we're
+                        // about to scroll to actually exists this frame.
+                        if want_scroll && is_active_obj {
+                            collapsing.set_open(true);
+                        }
 
-                                let extra_aliases = sym.aliases.len().saturating_sub(1);
-
-                                let clickable_sym = ui
-                                    .horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        let label = ui.selectable_label(false, text);
-
-                                        if extra_aliases > 0 {
-                                            ui.label(
-                                                RichText::new(format!("+{extra_aliases}"))
-                                                    .weak()
-                                                    .color(
-                                                        super::THEME.overlay1.gamma_multiply(0.5),
-                                                    ),
-                                            );
+                        collapsing
+                            // header styling
+                            .show_header(ui, |ui| {
+                                ui.label(obj_name.clone());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(RichText::new("✕").weak())
+                                                    .frame(false),
+                                            )
+                                            .on_hover_text(format!("Unload {}", obj.name))
+                                            .clicked()
+                                        {
+                                            unload = Some(key);
                                         }
 
-                                        label
-                                    })
-                                    .inner
-                                    //this instead of on_hover_text to prevent very long symbol names from wrapping as well as for multi-color
-                                    .on_hover_ui(|ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new(format!("0x{:x}:", sym.addr)).weak(),
-                                            );
+                                        ui.add_space(10.);
 
-                                            ui.label(sym.name);
+                                        let count_text =
+                                            format!("{} functions", obj.disasm.functions().count());
+
+                                        // Measure how wide the count label would be, without drawing it,
+                                        // so we can decide whether it fits before committing to show it.
+                                        let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                        let galley = ui.painter().layout_no_wrap(
+                                            count_text.clone(),
+                                            font_id,
+                                            ui.visuals().text_color(),
+                                        );
+
+                                        // Avoid function count overlapping the object name.
+                                        if ui.available_width() > galley.size().x {
+                                            ui.label(RichText::new(count_text).weak());
+                                        }
+                                    },
+                                );
+                            })
+                            // Symbols
+                            .body(|ui| {
+                                for sym in filtered_syms {
+                                    let mut text = RichText::new(truncate_middle(
+                                        sym.name,
+                                        (ui.available_width() / 8.) as usize,
+                                    ))
+                                    .weak();
+
+                                    // Highlight if selected
+                                    let is_active_sym = ui_app.app.active
+                                        == Some(Location {
+                                            obj: key,
+                                            addr: sym.addr,
                                         });
 
-                                        if extra_aliases > 0 {
-                                            ui.separator();
-                                            ui.label(
-                                                RichText::new("Symbol aliases:").weak().italics(),
-                                            );
-                                            for alias in sym.aliases.get(1..).unwrap_or(&[]) {
-                                                ui.label(RichText::new(alias));
+                                    if is_active_sym {
+                                        text = text.strong().color(super::THEME.mauve);
+                                    }
+
+                                    let extra_aliases = sym.aliases.len().saturating_sub(1);
+
+                                    let clickable_sym = ui
+                                        .horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                            let label = ui.selectable_label(false, text);
+
+                                            if extra_aliases > 0 {
+                                                ui.label(
+                                                    RichText::new(format!("+{extra_aliases}"))
+                                                        .weak()
+                                                        .color(
+                                                            super::THEME
+                                                                .overlay1
+                                                                .gamma_multiply(0.5),
+                                                        ),
+                                                );
                                             }
+
+                                            label
+                                        })
+                                        .inner
+                                        //this instead of on_hover_text to prevent very long symbol names from wrapping as well as for multi-color
+                                        .on_hover_ui(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(format!("0x{:x}:", sym.addr))
+                                                        .weak(),
+                                                );
+                                                ui.label(sym.name);
+                                            });
+
+                                            if extra_aliases > 0 {
+                                                ui.separator();
+                                                ui.label(
+                                                    RichText::new("Symbol aliases:")
+                                                        .weak()
+                                                        .italics(),
+                                                );
+                                                for alias in sym.aliases.get(1..).unwrap_or(&[]) {
+                                                    ui.label(RichText::new(alias));
+                                                }
+                                            }
+                                        });
+
+                                    if is_active_sym && want_scroll {
+                                        clickable_sym.scroll_to_me(Some(egui::Align::Center));
+                                        did_scroll = true;
+                                    }
+
+                                    clickable_sym.context_menu(|ui| {
+                                        if ui.button("Copy symbol name").clicked() {
+                                            ui.ctx().copy_text(sym.name.to_owned());
+                                        }
+                                        if ui.button("Copy symbol address").clicked() {
+                                            ui.ctx().copy_text(format!("{:x}", sym.addr));
+                                        }
+                                        if extra_aliases > 0
+                                            && ui.button("Copy all aliases").clicked()
+                                        {
+                                            ui.ctx().copy_text(sym.aliases.join("\n"));
+                                        }
+                                        ui.separator();
+                                        if ui.button("Find callers").clicked() {
+                                            find_callers = Some((key, sym.addr));
+                                            ui.close();
+                                        }
+
+                                        //TODO: show greyed out if no trace is loaded
+                                        if ui
+                                            .button(
+                                                RichText::new("Find instances in trace")
+                                                    .color(Color32::DEBUG_COLOR),
+                                            )
+                                            .clicked()
+                                        {
+                                            //TODO
                                         }
                                     });
 
-                                clickable_sym.context_menu(|ui| {
-                                    if ui.button("Copy symbol name").clicked() {
-                                        ui.ctx().copy_text(sym.name.to_owned());
+                                    // If clicked select as active
+                                    if clickable_sym.clicked() {
+                                        ui_app.app.active = Some(Location {
+                                            obj: key,
+                                            addr: sym.addr,
+                                        });
                                     }
-
-                                    if ui.button("Copy symbol address").clicked() {
-                                        ui.ctx().copy_text(format!("{:x}", sym.addr));
-                                    }
-
-                                    if extra_aliases > 0 && ui.button("Copy all aliases").clicked()
-                                    {
-                                        ui.ctx().copy_text(sym.aliases.join("\n"));
-                                    }
-
-                                    ui.separator();
-
-                                    if ui.button("Find callers").clicked() {
-                                        find_callers = Some((key, sym.addr));
-                                        ui.close();
-                                    }
-
-                                    //TODO: show greyed out if no trace is loaded
-                                    if ui
-                                        .button(
-                                            RichText::new("Find instances in trace")
-                                                .color(Color32::DEBUG_COLOR),
-                                        )
-                                        .clicked()
-                                    {
-                                        //TODO
-                                    }
-                                    //...
-                                });
-
-                                // If clicked select as active
-                                if clickable_sym.clicked() {
-                                    ui_app.app.active = Some(Location {
-                                        obj: key,
-                                        addr: sym.addr,
-                                    });
                                 }
-                            }
-                        });
+                            });
+                    }
+
+                    // Deferred: clear the one-shot focus request now that the walk
+                    // (which held the mutable borrow of ui_app) has finished.
+                    if did_scroll {
+                        ui_app.scroll_to_active = false;
                     }
                 });
             });

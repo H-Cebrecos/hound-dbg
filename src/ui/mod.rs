@@ -40,6 +40,11 @@ pub struct Ui {
     /// Address the disassembly panel should scroll into view on the next
     /// frame, set when navigating from another panel. Cleared once used.
     scroll_to: Option<u64>,
+
+    /// Set for one frame when the user asks to scroll the symbol panel to
+    /// whatever's currently `active`. Consumed (and cleared) by `sym_panel`
+    /// once it finds and scrolls to the matching row.
+    scroll_to_active: bool,
 }
 
 impl Ui {
@@ -59,6 +64,7 @@ impl Ui {
             source_active: HashMap::new(),
             callers: None,
             scroll_to: None,
+            scroll_to_active: false,
         }
     }
 
@@ -280,5 +286,7 @@ impl eframe::App for Ui {
         trace_panel::trace_panel(ctx, self);
         disasm_panel::disasm_panel(ctx, self);
         callers_panel::callers_panel(ctx, self);
+
+        self.show_status_bar(ctx);
     }
 }

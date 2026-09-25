@@ -12,7 +12,7 @@
 
 use egui::{Context, RichText};
 
-use crate::{Location, ObjectKey};
+use crate::{Location, ObjectKey, ui::sym_panel::truncate_middle};
 
 /// Render the breakpoint panel.
 pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
@@ -42,7 +42,7 @@ pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
                 if total > 0 {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new(RichText::new("Clear all").weak()).frame(false))
+                            .add(egui::Button::new(RichText::new("Clear all").weak()))
                             .on_hover_text("Remove every breakpoint")
                             .clicked()
                         {
@@ -124,10 +124,24 @@ pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                         if dot.on_hover_text("Remove breakpoint").clicked() {
                                             remove = Some((key, addr));
                                         }
+                                        // Draw the address label FIRST so it claims its width before we
+                                        // size the (potentially truncated) location text against whatever
+                                        // remains.
+                                        let label = ui.selectable_label(
+                                            selected,
+                                            RichText::new(format!("{addr:08x}")).weak().monospace(),
+                                        );
 
                                         let mut location = RichText::new(match func {
                                             Some(f) if f.addr == addr => f.name.to_owned(),
-                                            Some(f) => format!("{}+{:#x}", f.name, addr - f.addr),
+                                            Some(f) => format!(
+                                                "{}+{:#x}",
+                                                truncate_middle(
+                                                    f.name,
+                                                    (ui.available_width() / 8.) as usize,
+                                                ),
+                                                addr - f.addr
+                                            ),
                                             None => "<no symbol>".to_owned(),
                                         });
                                         if selected {
@@ -136,10 +150,6 @@ pub fn break_panel(ctx: &Context, ui_app: &mut super::Ui) {
                                             location = location.italics().weak();
                                         }
 
-                                        let label = ui.selectable_label(
-                                            selected,
-                                            RichText::new(format!("{addr:08x}")).weak().monospace(),
-                                        );
                                         ui.label(location);
 
                                         label
